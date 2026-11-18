@@ -3,3 +3,4 @@ numpy>=1.24.0
 requests>=2.31.0
 flask>=3.0.0
 onnxruntime>=1.17.0
+ncnn>=1.0.20240410

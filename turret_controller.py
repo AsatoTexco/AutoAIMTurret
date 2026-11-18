@@ -10,6 +10,11 @@ import numpy as np
 import requests
 
 try:
+    import ncnn
+except ImportError:
+    ncnn = None
+
+try:
     import onnxruntime as ort
 except ImportError:
     ort = None
@@ -18,7 +23,6 @@ except ImportError:
 DEFAULT_TURRET_URL = os.environ.get("TURRET_URL", "http://192.168.100.5")
 DEFAULT_STREAM_URL = os.environ.get("STREAM_URL", "http://192.168.100.5:81/stream")
 DEFAULT_BACKEND = os.environ.get("AUTOAIM_BACKEND", "auto").lower()
-DEFAULT_OPENCL_FP16 = os.environ.get("AUTOAIM_OPENCL_FP16", "0") == "1"
 DEFAULT_CPU_THREADS = max(1, int(os.environ.get("AUTOAIM_CPU_THREADS", "4")))
 DEFAULT_MAX_FPS = float(os.environ.get("AUTOAIM_MAX_FPS", "20.0"))
 
@@ -327,7 +331,7 @@ class TurretHardwareClient:
 
 
 class PersonDetector:
-    """ONNX YOLOv8n multi-class (person/dog) detector with GPU (ORT/OpenCL) + YuNet fallback."""
+    """YOLOv8n multi-class (person/dog) detector with GPU (ORT/ncnn Vulkan) + YuNet fallback."""
 
     def __init__(
         self,
@@ -342,7 +346,9 @@ class PersonDetector:
         self._ort_session = None
         self._ort_input_name = None
         self._cv_net = None
-        self._use_cv_opencl: bool = False
+        self._ncnn_net = None
+        self._ncnn_input_name = "in0"
+        self._ncnn_output_name = "out0"
         self._yunet = None
         self._empty_count: int = 0
         self.device_info: str = "CPU"
@@ -350,6 +356,7 @@ class PersonDetector:
         if not os.path.exists(yolo_path):
             raise FileNotFoundError(f"YOLOv8 ONNX model not found at {yolo_path}")
 
+        cv2.setNumThreads(DEFAULT_CPU_THREADS)
         initialized = False
 
         # Step A: Check ONNX Runtime GPU execution providers
@@ -379,33 +386,40 @@ class PersonDetector:
                     except Exception:
                         self._ort_session = None
 
-        # Step B: OpenCV DNN + OpenCL GPU (e.g. AMD Radeon RX 580 via Mesa Rusticl)
-        if not initialized and DEFAULT_BACKEND in ("auto", "opencl"):
+        # Step B: ncnn Vulkan GPU (e.g. AMD Radeon RX 580 via Mesa RADV)
+        ncnn_param = os.path.splitext(yolo_path)[0] + ".ncnn.param"
+        ncnn_bin = os.path.splitext(yolo_path)[0] + ".ncnn.bin"
+        if (
+            not initialized
+            and ncnn is not None
+            and DEFAULT_BACKEND in ("auto", "vulkan")
+            and os.path.exists(ncnn_param)
+            and os.path.exists(ncnn_bin)
+        ):
             try:
-                cv2.ocl.setUseOpenCL(True)
-                if cv2.ocl.haveOpenCL():
-                    dev = cv2.ocl.Device.getDefault()
-                    gpu_flag = getattr(cv2.ocl, "Device_TYPE_GPU", getattr(cv2.ocl, "DEVICE_TYPE_GPU", 4))
-                    is_gpu = bool(dev.available() and (dev.type() & gpu_flag))
-                    if is_gpu or DEFAULT_BACKEND == "opencl":
-                        if hasattr(cv2.dnn, "ENGINE_CLASSIC"):
-                            net = cv2.dnn.readNetFromONNX(yolo_path, engine=cv2.dnn.ENGINE_CLASSIC)
-                        else:
-                            net = cv2.dnn.readNetFromONNX(yolo_path)
-                        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                        target = cv2.dnn.DNN_TARGET_OPENCL_FP16 if DEFAULT_OPENCL_FP16 else cv2.dnn.DNN_TARGET_OPENCL
-                        net.setPreferableTarget(target)
-                        dummy = np.zeros((1, 3, self.input_size, self.input_size), dtype=np.float32)
-                        net.setInput(dummy)
-                        _ = net.forward()
-                        self._cv_net = net
-                        self._use_cv_opencl = True
-                        dev_name = (dev.name() or "").strip() or "Radeon RX 580"
-                        self.device_info = f"GPU OpenCL ({dev_name})"
-                        initialized = True
+                hw_gpu_idx = next(
+                    (i for i in range(ncnn.get_gpu_count()) if ncnn.get_gpu_info(i).type() in (0, 1)),
+                    None,
+                )
+                if hw_gpu_idx is not None:
+                    net = ncnn.Net()
+                    net.opt.use_vulkan_compute = True
+                    net.opt.use_fp16_packed = False
+                    net.opt.use_fp16_storage = False
+                    net.opt.use_fp16_arithmetic = False
+                    net.opt.num_threads = DEFAULT_CPU_THREADS
+                    net.set_vulkan_device(hw_gpu_idx)
+                    net.load_param(ncnn_param)
+                    net.load_model(ncnn_bin)
+                    self._ncnn_net = net
+                    self._ncnn_input_name = net.input_names()[0]
+                    self._ncnn_output_name = net.output_names()[0]
+                    _ = self._run_ncnn(np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8))
+                    dev_name = ncnn.get_gpu_info(hw_gpu_idx).device_name().strip() or "Vulkan GPU"
+                    self.device_info = f"GPU Vulkan ({dev_name})"
+                    initialized = True
             except Exception:
-                self._cv_net = None
-                self._use_cv_opencl = False
+                self._ncnn_net = None
 
         # Step C: CPU Fallback (ONNX Runtime or OpenCV DNN)
         if not initialized:
@@ -437,6 +451,31 @@ class PersonDetector:
         else:
             self._cv_net = cv2.dnn.readNetFromONNX(self._yolo_path)
             self.device_info = "CPU OpenCV DNN"
+
+    def _run_ncnn(self, canvas: np.ndarray) -> np.ndarray:
+        mat_in = ncnn.Mat.from_pixels(
+            canvas,
+            ncnn.Mat.PixelType.PIXEL_BGR2RGB,
+            self.input_size,
+            self.input_size,
+        )
+        mat_in.substract_mean_normalize([], [1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0])
+        ex = self._ncnn_net.create_extractor()
+        ex.input(self._ncnn_input_name, mat_in)
+        ret, mat_out = ex.extract(self._ncnn_output_name)
+        if ret != 0:
+            raise RuntimeError(f"ncnn extract failed with code {ret}")
+        return np.array(mat_out)[None, ...]
+
+    def _run_ort_or_cv(self, canvas: np.ndarray) -> np.ndarray:
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        blob = np.ascontiguousarray(
+            np.transpose(rgb.astype(np.float32) * (1.0 / 255.0), (2, 0, 1))[None, ...]
+        )
+        if self._ort_session is not None:
+            return self._ort_session.run(None, {self._ort_input_name: blob})[0]
+        self._cv_net.setInput(blob)
+        return self._cv_net.forward()
 
     def detect(
         self,
@@ -480,23 +519,16 @@ class PersonDetector:
         canvas = np.full((sz, sz, 3), 114, dtype=np.uint8)
         canvas[dy : dy + nh, dx : dx + nw] = resized
 
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        blob = np.transpose(rgb.astype(np.float32) * (1.0 / 255.0), (2, 0, 1))[None, ...]
-
-        if self._use_cv_opencl and self._cv_net is not None:
+        if self._ncnn_net is not None:
             try:
-                self._cv_net.setInput(blob)
-                output = self._cv_net.forward()
+                output = self._run_ncnn(canvas)
             except Exception:
-                self._use_cv_opencl = False
-                if self._ort_session is None:
+                self._ncnn_net = None
+                if self._ort_session is None and self._cv_net is None:
                     self._init_cpu_backend()
-                output = self._ort_session.run(None, {self._ort_input_name: blob})[0]
-        elif self._ort_session is not None:
-            output = self._ort_session.run(None, {self._ort_input_name: blob})[0]
+                output = self._run_ort_or_cv(canvas)
         else:
-            self._cv_net.setInput(blob)
-            output = self._cv_net.forward()
+            output = self._run_ort_or_cv(canvas)
 
         # YOLOv8 output: [1, 84, 8400] -> transpose to [8400, 84]
         preds = output[0].T

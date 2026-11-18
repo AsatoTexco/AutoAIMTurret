@@ -7,10 +7,10 @@ Sistema simples, direto e 100% funcional que processa o vídeo da mini torreta E
 1. **`turret_controller.py`**
    - **`MJPEGStreamReader`**: Consome o stream MJPEG em `http://192.168.100.5:81/stream`, aplica a rotação correta (`90°` horário por padrão), alinha marcadores SOI/EOI e descarta frames antigos para manter latência mínima.
    - **`TurretHardwareClient`**: Fila HTTP *single-flight* orientada a eventos (`_wakeup_event`) com histórico temporal de posições (`_pose_history`) para compensação de latência.
-   - **`PersonDetector`**: Suporte multi-classe (`person` e `dog`) com detecção automática de GPU (**OpenCL via Mesa Rusticl para AMD Radeon RX 580** / provedores GPU do ONNX Runtime) e fallback automático para CPU (`onnxruntime`) + fallback facial YuNet.
+   - **`PersonDetector`**: Suporte multi-classe (`person` e `dog`) com detecção automática de GPU (**Vulkan via ncnn + Mesa RADV para AMD Radeon RX 580** / provedores GPU do ONNX Runtime) e fallback automático para CPU (`onnxruntime`) + fallback facial YuNet.
    - **`AutoAimEngine`**: Controlador dinâmico não-linear baseado no ângulo real do alvo no mundo, com zona morta, modos de mira (`Centro`, `Peito`, `Cabeça`) e modos de tiro (`Eficiente na Mira`, `Imediato ao Detectar`, `Não Acender`).
 2. **`app.py`**
-   - Inicia o `AutoAimEngine` e expõe o painel web em `http://localhost:5000/` (`/video_feed`, `/api/status`, `/api/config`, `/api/action`), exibindo inclusive o badge do acelerador de hardware ativo (`HW: GPU OpenCL ...` ou `CPU`).
+   - Inicia o `AutoAimEngine` e expõe o painel web em `http://localhost:5000/` (`/video_feed`, `/api/status`, `/api/config`, `/api/action`), exibindo inclusive o badge do acelerador de hardware ativo (`HW: GPU Vulkan ...` ou `CPU`).
 
 > **Observação importante:** O servidor MJPEG do ESP32-CAM (porta `81`) aceita apenas **uma conexão por vez**. Enquanto o AutoAIM estiver rodando, visualize a câmera pelo painel `http://localhost:5000/` em vez de abrir `http://192.168.100.5/` diretamente.
 
@@ -18,7 +18,7 @@ Sistema simples, direto e 100% funcional que processa o vídeo da mini torreta E
 
 ## Deploy com Docker Compose (Ubuntu Server + Xeon E5-2620 v3 + 16GB RAM + RX 580 8GB)
 
-O projeto já inclui `Dockerfile` baseado em `ubuntu:24.04` com suporte a OpenCL 3.0 via Mesa **Rusticl** (`RUSTICL_ENABLE=radeonsi`) para rodar o YOLOv8n diretamente na **AMD Radeon RX 580 8GB** através de `/dev/dri`.
+O projeto já inclui `Dockerfile` baseado em `ubuntu:24.04` com suporte a Vulkan via Mesa **RADV** (`mesa-vulkan-drivers`) e `ncnn` para rodar o YOLOv8n diretamente na **AMD Radeon RX 580 8GB** através de `/dev/dri`.
 
 ### 1. Pré-requisitos no Ubuntu Server
 - Docker e Docker Compose instalados (`docker compose version`)
@@ -33,10 +33,10 @@ docker compose up -d --build
 
 ### 3. Verificar se a RX 580 foi reconhecida no container
 ```bash
-docker exec autoaim-turret clinfo | grep -E "Device Name|Device Type"
+docker exec autoaim-turret vulkaninfo --summary
 docker compose logs -f autoaim
 ```
-No painel web (`http://<IP-DO-SERVIDOR>:5000/`), o badge superior exibirá `HW: GPU OpenCL (...)`.
+No painel web (`http://<IP-DO-SERVIDOR>:5000/`), o badge superior exibirá `HW: GPU Vulkan (...)`.
 
 ---
 
