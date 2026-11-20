@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#090c11">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>AutoAIM Turret — Controle CV &amp; Game HUD</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2338bdf8' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='8'/%3E%3Ccircle cx='12' cy='12' r='2.2' fill='%2322c55e'/%3E%3Cline x1='12' y1='2' x2='12' y2='6'/%3E%3Cline x1='12' y1='18' x2='12' y2='22'/%3E%3Cline x1='2' y1='12' x2='6' y2='12'/%3E%3Cline x1='18' y1='12' x2='22' y2='12'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Command Header -->
+    <header class="topbar">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="8"/>
+              <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+              <line x1="12" y1="2" x2="12" y2="6"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="2" y1="12" x2="6" y2="12"/>
+              <line x1="18" y1="12" x2="22" y2="12"/>
+            </svg>
+          </div>
+          <div>
+            <h1>AutoAIM Turret</h1>
+            <div class="brand-sub">ESP32-CAM · Pan-Tilt · Laser Verde · YOLOv8n</div>
+          </div>
+        </div>
+
+        <button type="button" class="header-game-btn" onclick="enterGameMode()" title="Abrir HUD de Jogo em Tela Cheia">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="6" width="20" height="12" rx="4"/>
+            <path d="M7 12h4M9 10v4"/>
+            <circle cx="16" cy="11" r="1" fill="currentColor"/>
+            <circle cx="18" cy="13" r="1" fill="currentColor"/>
+          </svg>
+          <span>Modo Jogo</span>
+        </button>
+      </div>
+
+      <!-- Primary Mode Switcher -->
+      <div class="mode-switcher" role="group" aria-label="Modo de Operação">
+        <button type="button" id="modeAutoBtn" class="mode-btn active" onclick="setOperatingMode(true)">
+          <span class="dot"></span>
+          Auto-Aim (CV)
+        </button>
+        <button type="button" id="modeManualBtn" class="mode-btn" onclick="setOperatingMode(false)">
+          <span class="dot"></span>
+          Manual
+        </button>
+      </div>
+
+      <!-- Status Indicators -->
+      <div class="status-strip">
+        <span id="pillStream" class="status-pill warn">
+          <span class="pill-dot"></span>
+          <span class="pill-text">CONECTANDO</span>
+        </span>
+        <span id="pillEco" class="status-pill eco-standby" title="Status do Modo Econômico da Visão Computacional">
+          <span class="pill-dot"></span>
+          <span class="pill-text">ECO 15s</span>
+        </span>
+        <span id="pillLaser" class="status-pill">
+          <span class="pill-dot"></span>
+          <span class="pill-text">LASER OFF</span>
+        </span>
+        <span id="pillLed" class="status-pill">
+          <span class="pill-dot"></span>
+          <span class="pill-text">FLASH OFF</span>
+        </span>
+        <span id="pillDevice" class="status-pill pill-device">
+          <span class="pill-text">HW: ...</span>
+        </span>
+      </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="workspace">
+      <!-- Left Column: Video Viewport, Arcade / Quick Controls & Live Telemetry -->
+      <section class="stage-column">
+        <div id="videoStage" class="video-stage" tabindex="0">
+          <img id="videoFeed" src="/video_feed" alt="Stream de vídeo da torreta" draggable="false">
+
+          <!-- Floating Stage Badges & Actions (when unlocked and not in Game Mode) -->
+          <div class="stage-floating-actions">
+            <div class="stage-badge-group">
+              <span id="stageTargetBadge" class="stage-badge">ALVO: BUSCANDO</span>
+              <span id="stageEcoBadge" class="stage-badge eco-badge hidden">ECO · 1.0 FPS</span>
+            </div>
+            <div class="stage-action-group">
+              <button type="button" id="btnStageGameMode" class="stage-game-chip" onclick="enterGameMode()" title="Abrir Modo Jogo em Tela Cheia">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+                </svg>
+                <span>Modo Jogo</span>
+              </button>
+              <button type="button" id="btnStagePointerLock" class="stage-lock-chip desktop-only" onclick="enterPointerLock()" title="Travar mouse e controlar a câmera manualmente (Atalho: M)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="9"/>
+                  <line x1="12" y1="3" x2="12" y2="7"/>
+                  <line x1="12" y1="17" x2="12" y2="21"/>
+                  <line x1="3" y1="12" x2="7" y2="12"/>
+                  <line x1="17" y1="12" x2="21" y2="12"/>
+                </svg>
+                <span>Travar Mouse (FPS)</span>
+                <kbd>M</kbd>
+              </button>
+            </div>
+          </div>
+
+          <!-- Tactical Pointer-Lock HUD (Desktop FPS Mode) -->
+          <div id="fpsHud" class="fps-hud" aria-hidden="true">
+            <div class="fps-hud-top">
+              <div class="fps-badge active">
+                <span class="pulse-dot"></span>
+                CONTROLE FPS ATIVO · MOUSE PRESO
+              </div>
+              <div class="fps-actuators">
+                <span id="hudLaserChip" class="hud-chip">LASER OFF</span>
+                <span id="hudLedChip" class="hud-chip">FLASH OFF</span>
+              </div>
+            </div>
+
+            <div class="fps-reticle" id="fpsReticle">
+              <svg viewBox="0 0 120 120" fill="none">
+                <circle cx="60" cy="60" r="24" class="ret-ring"/>
+                <line x1="60" y1="14" x2="60" y2="44" class="ret-line"/>
+                <line x1="60" y1="76" x2="60" y2="106" class="ret-line"/>
+                <line x1="14" y1="60" x2="44" y2="60" class="ret-line"/>
+                <line x1="76" y1="60" x2="106" y2="60" class="ret-line"/>
+                <circle cx="60" cy="60" r="2.5" class="ret-dot"/>
+              </svg>
+            </div>
+
+            <div class="fps-hud-bottom">
+              <div class="fps-coords">
+                <span>PAN <strong id="hudX">90°</strong></span>
+                <span class="sep">·</span>
+                <span>TILT <strong id="hudY">90°</strong></span>
+                <span class="sep">·</span>
+                <span>SENS <strong id="hudSens">0.18°/px</strong></span>
+              </div>
+              <div class="fps-hints">
+                <span><kbd>LMB</kbd> Laser</span>
+                <span><kbd>RMB</kbd> Flash</span>
+                <span><kbd>C</kbd> Centro</span>
+                <span><kbd>Scroll</kbd> Sens</span>
+                <span><kbd>ESC</kbd> Soltar</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mobile / Fullscreen Game Cockpit HUD -->
+          <div id="gameHud" class="game-hud" aria-hidden="true">
+            <!-- Direct Swipe-to-Aim Surface -->
+            <div id="gameAimSurface" class="game-aim-surface"></div>
+
+            <!-- Dynamic Tactical Game Reticle -->
+            <div id="gameReticle" class="game-reticle">
+              <svg viewBox="0 0 160 160" fill="none">
+                <path d="M36 52V36h16M124 52V36h-16M36 108v16h16M124 108v16h-16" class="gret-bracket"/>
+                <circle cx="80" cy="80" r="30" class="gret-ring"/>
+                <line x1="80" y1="22" x2="80" y2="58" class="gret-line"/>
+                <line x1="80" y1="102" x2="80" y2="138" class="gret-line"/>
+                <line x1="22" y1="80" x2="58" y2="80" class="gret-line"/>
+                <line x1="102" y1="80" x2="138" y2="80" class="gret-line"/>
+                <circle cx="80" cy="80" r="3" class="gret-dot"/>
+              </svg>
+              <span class="game-aim-hint" id="gameAimHint">ARRASTE PARA MIRAR</span>
+            </div>
+
+            <!-- Top Cockpit Bar -->
+            <div class="game-top-bar">
+              <div class="game-top-left">
+                <span id="gameStreamPill" class="game-chip warn">
+                  <span class="chip-dot"></span>
+                  <span id="gameStreamText">OFF</span>
+                </span>
+                <button type="button" id="gameModeSwitch" class="game-mode-pill" onclick="toggleOperatingModeFromGame()">
+                  <span class="chip-dot"></span>
+                  <span id="gameModeText">AUTO-AIM</span>
+                </button>
+                <span id="gameTargetBadge" class="game-chip">BUSCANDO</span>
+              </div>
+
+              <div class="game-top-right">
+                <div class="game-telemetry-chip">
+                  <span>X <strong id="gameHudX">90°</strong></span>
+                  <span>Y <strong id="gameHudY">90°</strong></span>
+                  <span><strong id="gameHudFps">0.0</strong> FPS</span>
+                  <span class="hide-narrow" id="gameHudRtt">—ms</span>
+                </div>
+                <button type="button" id="btnGameSettings" class="game-icon-btn" onclick="toggleGameDrawer()" aria-label="Configurações rápidas">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.78 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                  </svg>
+                </button>
+                <button type="button" id="btnExitGame" class="game-exit-btn" onclick="exitGameMode()">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M9 9L4 4m0 0v5m0-5h5M15 9l5-5m0 0v5m0-5h-5M9 15l-5 5m0 0v-5m0 5h5M15 15l5 5m0 0v-5m0 5h-5"/>
+                  </svg>
+                  <span>Sair</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Bottom Gamepad Overlay: Left Thumb Joystick & Right Thumb Fire Cluster -->
+            <div class="game-bottom-hud">
+              <!-- Left Thumb: Virtual Analog Joystick -->
+              <div class="game-stick-wrap">
+                <div id="gameJoystick" class="joystick-pad game-stick" role="slider" aria-label="Joystick Pan e Tilt">
+                  <div class="joystick-ring"></div>
+                  <div class="joystick-cross-h"></div>
+                  <div class="joystick-cross-v"></div>
+                  <div class="joystick-deadzone"></div>
+                  <div class="joystick-knob" id="gameJoystickKnob"></div>
+                  <span class="joystick-dir n">▲</span>
+                  <span class="joystick-dir s">▼</span>
+                  <span class="joystick-dir w">◀</span>
+                  <span class="joystick-dir e">▶</span>
+                </div>
+                <div class="stick-caption" id="gameStickLabel">JOYSTICK · 90° / 90°</div>
+              </div>
+
+              <!-- Right Thumb: Tactical Action Cluster -->
+              <div class="game-actions-pad">
+                <div class="game-secondary-arc">
+                  <button type="button" id="gameBtnCenter" class="g-sec-btn" onclick="centerTurret()" title="Centralizar Torreta">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="12" cy="12" r="7"/>
+                      <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
+                    </svg>
+                    <span>90°</span>
+                  </button>
+                  <button type="button" id="gameBtnFlash" class="g-sec-btn flash" onclick="toggleManualLed()" title="Alternar LED Flash">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                    </svg>
+                    <span>Flash</span>
+                  </button>
+                  <button type="button" id="gameBtnLatchLaser" class="g-sec-btn laser" onclick="toggleManualLaser()" title="Travar Laser Contínuo">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="5" y="11" width="14" height="10" rx="2"/>
+                      <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+                    </svg>
+                    <span>Trava</span>
+                  </button>
+                </div>
+
+                <button type="button" id="gameBtnFireLaser" class="fire-trigger game-fire-btn" oncontextmenu="return false">
+                  <span class="fire-ring"></span>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <circle cx="12" cy="12" r="8"/>
+                    <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
+                    <line x1="12" y1="2" x2="12" y2="6"/>
+                    <line x1="12" y1="18" x2="12" y2="22"/>
+                    <line x1="2" y1="12" x2="6" y2="12"/>
+                    <line x1="18" y1="12" x2="22" y2="12"/>
+                  </svg>
+                  <span class="fire-label">LASER</span>
+                  <span class="fire-sub">SEGURAR</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Quick In-Game Settings Slide-Over Drawer -->
+            <div id="gameDrawer" class="game-drawer" aria-hidden="true">
+              <div class="game-drawer-header">
+                <h3>Ajustes Rápidos</h3>
+                <button type="button" class="drawer-close-btn" onclick="toggleGameDrawer(false)">✕</button>
+              </div>
+              <div class="game-drawer-body">
+                <div class="drawer-section">
+                  <div class="field-top">
+                    <label for="gameJoySens">Velocidade do Joystick</label>
+                    <span class="mono-val" id="gameJoySensVal">115 °/s</span>
+                  </div>
+                  <input type="range" id="gameJoySens" min="30" max="240" step="5" value="115" oninput="onJoystickSensInput(this.value)">
+                </div>
+
+                <div class="drawer-section">
+                  <div class="field-top">
+                    <label for="gameTouchSens">Sensibilidade Arraste na Tela</label>
+                    <span class="mono-val" id="gameTouchSensVal">0.24 °/px</span>
+                  </div>
+                  <input type="range" id="gameTouchSens" min="0.08" max="0.60" step="0.01" value="0.24" oninput="onTouchSensInput(this.value)">
+                </div>
+
+                <div class="drawer-section">
+                  <div class="toggle-row">
+                    <div>
+                      <div class="row-title">Modo Econômico (CV)</div>
+                      <div class="row-sub" id="gameEcoSub">1.0 FPS após 15s ocioso</div>
+                    </div>
+                    <label class="switch eco">
+                      <input type="checkbox" id="gameEcoMode" checked onchange="onGameEcoToggle(this.checked)">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="toggle-row">
+                    <div>
+                      <div class="row-title">Flash no Movimento (Eco)</div>
+                      <div class="row-sub">Acende a luz ao acordar por movimento</div>
+                    </div>
+                    <label class="switch amber">
+                      <input type="checkbox" id="gameEcoMotionFlash" checked onchange="onGameEcoFlashToggle(this.checked)">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="drawer-section">
+                  <div class="toggle-row">
+                    <div class="row-title">Inverter Eixo X</div>
+                    <label class="switch">
+                      <input type="checkbox" id="gameInvX" onchange="syncInvertFromDrawer()">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="toggle-row">
+                    <div class="row-title">Inverter Eixo Y</div>
+                    <label class="switch">
+                      <input type="checkbox" id="gameInvY" onchange="syncInvertFromDrawer()">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="drawer-section">
+                  <label class="drawer-label">Ponto de Mira (Auto-Aim)</label>
+                  <div class="segmented-3" id="gameAimModeSeg">
+                    <button type="button" data-val="head" class="seg-btn" onclick="setAimMode('head')">Cabeça</button>
+                    <button type="button" data-val="upper" class="seg-btn" onclick="setAimMode('upper')">Peito</button>
+                    <button type="button" data-val="center" class="seg-btn active" onclick="setAimMode('center')">Centro</button>
+                  </div>
+                </div>
+
+                <div class="drawer-section">
+                  <label class="drawer-label">Resolução da Câmera</label>
+                  <div class="res-grid compact-res" id="gameResGrid">
+                    <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)"><strong>QVGA</strong><span>320×240</span></button>
+                    <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
+                    <button type="button" class="res-btn active" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×600</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Inline Mobile Arcade Deck (Two-Thumb Cockpit directly below Video on Mobile/Touch) -->
+        <div id="mobileArcadeDeck" class="mobile-arcade-deck">
+          <div class="arcade-deck-top">
+            <div class="arcade-title">
+              <span class="arcade-dot"></span>
+              <span>Cockpit Touch</span>
+              <span class="arcade-coords" id="inlineCoords">90° · 90°</span>
+            </div>
+            <button type="button" class="arcade-fullscreen-btn" onclick="enterGameMode()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+              </svg>
+              <span>Tela Cheia</span>
+            </button>
+          </div>
+
+          <div class="arcade-deck-body">
+            <!-- Left Thumb Joystick -->
+            <div class="inline-stick-col">
+              <div id="inlineJoystick" class="joystick-pad inline-stick" role="slider" aria-label="Joystick analógico">
+                <div class="joystick-ring"></div>
+                <div class="joystick-cross-h"></div>
+                <div class="joystick-cross-v"></div>
+                <div class="joystick-deadzone"></div>
+                <div class="joystick-knob" id="inlineJoystickKnob"></div>
+              </div>
+              <span class="inline-stick-hint">Arraste para mirar</span>
+            </div>
+
+            <!-- Right Thumb Tactical Buttons -->
+            <div class="inline-actions-col">
+              <button type="button" id="inlineBtnFireLaser" class="fire-trigger inline-fire-btn" oncontextmenu="return false">
+                <span class="fire-ring"></span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <circle cx="12" cy="12" r="8"/>
+                  <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+                  <line x1="12" y1="2" x2="12" y2="6"/>
+                  <line x1="12" y1="18" x2="12" y2="22"/>
+                  <line x1="2" y1="12" x2="6" y2="12"/>
+                  <line x1="18" y1="12" x2="22" y2="12"/>
+                </svg>
+                <div>
+                  <div class="fire-label">DISPARAR LASER</div>
+                  <div class="fire-sub">Segure para pulso 0ms</div>
+                </div>
+              </button>
+
+              <div class="inline-btn-row">
+                <button type="button" id="inlineBtnLatchLaser" class="arcade-mini-btn laser" onclick="toggleManualLaser()">
+                  <span class="btn-led"></span>
+                  <span>Travar</span>
+                </button>
+                <button type="button" id="inlineBtnFlash" class="arcade-mini-btn flash" onclick="toggleManualLed()">
+                  <span class="btn-led"></span>
+                  <span>Flash</span>
+                </button>
+                <button type="button" id="inlineBtnCenter" class="arcade-mini-btn neutral" onclick="centerTurret()">
+                  <span>Centro</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Desktop Quick Action Dock -->
+        <div class="quick-dock">
+          <button type="button" id="btnPointerLock" class="dock-btn primary" onclick="enterPointerLock()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M5 3l14 9-7 1-3 7-4-17z"/>
+            </svg>
+            <span>Travar Mouse (FPS)</span>
+            <kbd>M</kbd>
+          </button>
+
+          <button type="button" id="btnQuickGameMode" class="dock-btn game" onclick="enterGameMode()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="6" width="20" height="12" rx="4"/>
+              <path d="M7 12h4M9 10v4"/>
+              <circle cx="16" cy="11" r="1" fill="currentColor"/>
+              <circle cx="18" cy="13" r="1" fill="currentColor"/>
+            </svg>
+            <span>Modo Jogo</span>
+          </button>
+
+          <button type="button" id="btnQuickLaser" class="dock-btn laser" onclick="toggleManualLaser()">
+            <span class="btn-led"></span>
+            <span>Laser</span>
+            <kbd>L</kbd>
+          </button>
+
+          <button type="button" id="btnQuickLed" class="dock-btn flash" onclick="toggleManualLed()">
+            <span class="btn-led"></span>
+            <span>Flash</span>
+            <kbd>F</kbd>
+          </button>
+
+          <button type="button" id="btnQuickCenter" class="dock-btn neutral" onclick="centerTurret()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="7"/>
+              <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
+            </svg>
+            <span>Centro</span>
+            <kbd>C</kbd>
+          </button>
+        </div>
+
+        <!-- Telemetry Bar -->
+        <div class="telemetry-bar">
+          <div class="telemetry-card">
+            <span class="t-label">Servos X / Y</span>
+            <span class="t-val" id="mAngles">90° / 90°</span>
+            <span class="t-sub">IO14 · IO13</span>
+          </div>
+          <div class="telemetry-card">
+            <span class="t-label">Alvo / Erro</span>
+            <span class="t-val" id="mError">0, 0 px</span>
+            <span class="t-sub" id="mTargetSub">Buscando...</span>
+          </div>
+          <div class="telemetry-card">
+            <span class="t-label">CV FPS / Inf.</span>
+            <span class="t-val" id="mPerf">0.0 / 0ms</span>
+            <span class="t-sub" id="mFrameRes">—</span>
+          </div>
+          <div class="telemetry-card">
+            <span class="t-label">Single-Flight</span>
+            <span class="t-val" id="mRtt">— ms</span>
+            <span class="t-sub" id="mPriorityTag">0ms Prio · 30ms Mov</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Tabbed Control Sidebar -->
+      <aside class="sidebar">
+        <div class="tab-bar" role="tablist">
+          <button type="button" class="tab-btn active" role="tab" data-tab="tabControl" onclick="switchTab('tabControl', this)">Controle</button>
+          <button type="button" class="tab-btn" role="tab" data-tab="tabVision" onclick="switchTab('tabVision', this)">Visão &amp; Eco</button>
+          <button type="button" class="tab-btn" role="tab" data-tab="tabHardware" onclick="switchTab('tabHardware', this)">Câmera &amp; HW</button>
+        </div>
+
+        <!-- TAB 1: CONTROL & ACTUATORS -->
+        <div id="tabControl" class="tab-panel active">
+          <!-- Actuators -->
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Atuadores (Prioridade 0 ms)</h2>
+              <span class="chip-meta">IO15 · IO4</span>
+            </div>
+
+            <div class="actuator-row">
+              <div class="actuator-info">
+                <span class="actuator-dot green" id="dotLaser"></span>
+                <div>
+                  <div class="actuator-title">Laser Verde</div>
+                  <div class="actuator-pin">GPIO 15 · laser=0|1</div>
+                </div>
+              </div>
+              <div class="actuator-actions">
+                <button type="button" id="btnPulseLaser" class="pulse-btn laser" oncontextmenu="return false">Pulso</button>
+                <label class="switch green">
+                  <input type="checkbox" id="toggleLaser" onchange="onLaserSwitchChange()">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="actuator-row">
+              <div class="actuator-info">
+                <span class="actuator-dot amber" id="dotLed"></span>
+                <div>
+                  <div class="actuator-title">LED Flash</div>
+                  <div class="actuator-pin">GPIO 4 · led=0|1</div>
+                </div>
+              </div>
+              <div class="actuator-actions">
+                <button type="button" id="btnPulseLed" class="pulse-btn flash" oncontextmenu="return false">Pulso</button>
+                <label class="switch amber">
+                  <input type="checkbox" id="toggleLed" onchange="onLedSwitchChange()">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Manual Pan/Tilt Pad & Sliders -->
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Controle Manual Pan / Tilt</h2>
+              <span class="chip-meta" id="manualStatusBadge">30 ms Single-Flight</span>
+            </div>
+
+            <div id="gimbalPad" class="gimbal-pad" title="Arraste para mover a câmera manualmente">
+              <div class="gimbal-grid"></div>
+              <div class="gimbal-cross-h"></div>
+              <div class="gimbal-cross-v"></div>
+              <div id="gimbalGuideH" class="gimbal-guide-h"></div>
+              <div id="gimbalGuideV" class="gimbal-guide-v"></div>
+              <span class="gimbal-axis top" id="gimbalTop">Y 0°</span>
+              <span class="gimbal-axis bottom" id="gimbalBottom">Y 180°</span>
+              <span class="gimbal-axis left" id="gimbalLeft">X 180°</span>
+              <span class="gimbal-axis right" id="gimbalRight">X 0°</span>
+              <span class="gimbal-corner br" id="gimbalCoords">90° · 90°</span>
+              <div id="gimbalThumb" class="gimbal-thumb"></div>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="sliderX">Eixo X (IO14)</label>
+                <span class="mono-val" id="sliderXVal">90°</span>
+              </div>
+              <input type="range" id="sliderX" min="0" max="180" step="1" value="90" oninput="onManualSliderInput()">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="sliderY">Eixo Y (IO13)</label>
+                <span class="mono-val" id="sliderYVal">90°</span>
+              </div>
+              <input type="range" id="sliderY" min="0" max="180" step="1" value="90" oninput="onManualSliderInput()">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="joySens">Velocidade Joystick Mobile</label>
+                <span class="mono-val" id="joySensVal">115 °/s</span>
+              </div>
+              <input type="range" id="joySens" min="30" max="240" step="5" value="115" oninput="onJoystickSensInput(this.value)">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="touchSens">Sensibilidade Arraste Touch</label>
+                <span class="mono-val" id="touchSensVal">0.24 °/px</span>
+              </div>
+              <input type="range" id="touchSens" min="0.08" max="0.60" step="0.01" value="0.24" oninput="onTouchSensInput(this.value)">
+            </div>
+
+            <div class="slider-field desktop-only">
+              <div class="field-top">
+                <label for="mouseSens">Sensibilidade Mouse FPS</label>
+                <span class="mono-val" id="mouseSensVal">0.18 °/px</span>
+              </div>
+              <input type="range" id="mouseSens" min="0.05" max="0.60" step="0.01" value="0.18" oninput="onMouseSensInput()">
+            </div>
+          </div>
+
+          <!-- Auto-Fire Rules -->
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Disparo Automático (Auto-Aim)</h2>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Ativar Disparo Automático</div>
+                <div class="row-sub">Aciona ao mirar durante Auto-Aim</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="autoFire" checked onchange="onAutoFireChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="field-block">
+              <label for="ledMode">Gatilho do Disparo</label>
+              <select id="ledMode" onchange="onLedModeChange()">
+                <option value="on_lock" selected>Eficiente (Apenas com Alvo na Mira)</option>
+                <option value="on_detect">Imediato (Assim que Detectar Alvo)</option>
+                <option value="off">Desativado (Apenas Rastrear)</option>
+              </select>
+            </div>
+
+            <div class="field-block">
+              <label>Saída do Disparo Automático</label>
+              <div class="segmented-3" id="fireOutputSeg">
+                <button type="button" data-val="laser" class="seg-btn active" onclick="setAutoFireOutput('laser')">Laser</button>
+                <button type="button" data-val="led" class="seg-btn" onclick="setAutoFireOutput('led')">Flash</button>
+                <button type="button" data-val="both" class="seg-btn" onclick="setAutoFireOutput('both')">Ambos</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: COMPUTER VISION, ECO MODE & AIMING -->
+        <div id="tabVision" class="tab-panel">
+          <!-- Eco Mode Card -->
+          <div class="panel-card eco-card">
+            <div class="card-header">
+              <h2>Modo Econômico (Eco CV)</h2>
+              <span class="chip-meta eco-chip" id="ecoStatusChip">EM 15s</span>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Ativar Modo Econômico</div>
+                <div class="row-sub">Reduz a visão computacional após ociosidade</div>
+              </div>
+              <label class="switch eco">
+                <input type="checkbox" id="ecoMode" checked onchange="onEcoConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="ecoDelay">Tempo sem Alvo Reconhecido</label>
+                <span class="mono-val" id="ecoDelayVal">15 s</span>
+              </div>
+              <input type="range" id="ecoDelay" min="3" max="120" step="1" value="15" oninput="updateLabels()" onchange="onEcoConfigChange()">
+              <div class="preset-chips" id="ecoDelayPresets">
+                <button type="button" class="preset-chip" data-delay="5" onclick="setEcoDelayPreset(5)">5s</button>
+                <button type="button" class="preset-chip active" data-delay="15" onclick="setEcoDelayPreset(15)">15s</button>
+                <button type="button" class="preset-chip" data-delay="30" onclick="setEcoDelayPreset(30)">30s</button>
+                <button type="button" class="preset-chip" data-delay="60" onclick="setEcoDelayPreset(60)">60s</button>
+              </div>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="ecoFps">Taxa da IA no Modo Econômico</label>
+                <span class="mono-val" id="ecoFpsVal">1.0 FPS</span>
+              </div>
+              <input type="range" id="ecoFps" min="0.5" max="5.0" step="0.5" value="1.0" oninput="updateLabels()" onchange="onEcoConfigChange()">
+              <div class="preset-chips" id="ecoFpsPresets">
+                <button type="button" class="preset-chip" data-fps="0.5" onclick="setEcoFpsPreset(0.5)">0.5 FPS</button>
+                <button type="button" class="preset-chip active" data-fps="1" onclick="setEcoFpsPreset(1.0)">1 FPS</button>
+                <button type="button" class="preset-chip" data-fps="2" onclick="setEcoFpsPreset(2.0)">2 FPS</button>
+                <button type="button" class="preset-chip" data-fps="5" onclick="setEcoFpsPreset(5.0)">5 FPS</button>
+              </div>
+            </div>
+
+            <div class="card-divider"></div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Sensor de Movimento no Eco</div>
+                <div class="row-sub">Detecta mudança na cena e acorda a IA (~0.2ms)</div>
+              </div>
+              <label class="switch eco">
+                <input type="checkbox" id="ecoMotionWake" checked onchange="onEcoConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Acender Flash ao Detectar Movimento</div>
+                <div class="row-sub">Ilumina o ambiente para enxergar pessoas no escuro</div>
+              </div>
+              <label class="switch amber">
+                <input type="checkbox" id="ecoMotionFlash" checked onchange="onEcoConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Acender Flash Apenas no Escuro</div>
+                <div class="row-sub">Luminosidade atual: <strong id="ecoLumaVal">—</strong>/255 (&lt; 80 = escuro)</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="ecoFlashDarkOnly" onchange="onEcoConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="ecoMotionSens">Sensibilidade do Movimento</label>
+                <span class="mono-val" id="ecoMotionSensVal">50%</span>
+              </div>
+              <input type="range" id="ecoMotionSens" min="10" max="100" step="5" value="50" oninput="updateLabels()" onchange="onEcoConfigChange()">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="ecoFlashDur">Tempo de Luz / Verificação</label>
+                <span class="mono-val" id="ecoFlashDurVal">6 s</span>
+              </div>
+              <input type="range" id="ecoFlashDur" min="3" max="20" step="1" value="6" oninput="updateLabels()" onchange="onEcoConfigChange()">
+            </div>
+
+            <p class="card-hint">No modo eco, a torreta centraliza em 90°/90° e reduz a IA para o FPS definido. Ao detectar movimento, acorda a IA e pode acender o Flash temporariamente para validar se há alguém.</p>
+          </div>
+
+          <!-- Discord Face/Person Log Card -->
+          <div class="panel-card discord-card">
+            <div class="card-header">
+              <h2>Log de Rostos (Discord)</h2>
+              <span class="chip-meta discord-chip" id="discordStatusChip">PRONTO</span>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Ativar Log no Discord</div>
+                <div class="row-sub" id="discordMetaText">Webhook via .env · 0 envios</div>
+              </div>
+              <label class="switch discord">
+                <input type="checkbox" id="discordEnabled" checked onchange="onDiscordConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="discordCooldown">Cooldown entre Envios</label>
+                <span class="mono-val" id="discordCooldownVal">30 s</span>
+              </div>
+              <input type="range" id="discordCooldown" min="10" max="300" step="5" value="30" oninput="updateLabels()" onchange="onDiscordConfigChange()">
+              <div class="preset-chips" id="discordCooldownPresets">
+                <button type="button" class="preset-chip" data-cd="15" onclick="setDiscordCooldownPreset(15)">15s</button>
+                <button type="button" class="preset-chip active" data-cd="30" onclick="setDiscordCooldownPreset(30)">30s</button>
+                <button type="button" class="preset-chip" data-cd="60" onclick="setDiscordCooldownPreset(60)">60s</button>
+                <button type="button" class="preset-chip" data-cd="120" onclick="setDiscordCooldownPreset(120)">120s</button>
+              </div>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="discordAbsence">Ausência p/ Nova Visita</label>
+                <span class="mono-val" id="discordAbsenceVal">15 s</span>
+              </div>
+              <input type="range" id="discordAbsence" min="5" max="120" step="5" value="15" oninput="updateLabels()" onchange="onDiscordConfigChange()">
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Enviar Cena Completa + Recorte</div>
+                <div class="row-sub">Anexa imagem ampla junto com o rosto</div>
+              </div>
+              <label class="switch discord">
+                <input type="checkbox" id="discordIncludeScene" checked onchange="onDiscordConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Registrar Cachorros Também</div>
+                <div class="row-sub">Desligado = foca apenas em rostos e pessoas</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="discordLogDogs" onchange="onDiscordConfigChange()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <button type="button" id="btnDiscordTest" class="discord-test-btn" onclick="testDiscordWebhook()">
+              Enviar Teste Agora
+            </button>
+
+            <p class="card-hint">Escolhe a foto mais nítida de cada visita (janela de 2,5s) e envia apenas 1 registro enquanto a pessoa estiver na cena.</p>
+          </div>
+
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Detecção de Alvos</h2>
+              <span class="chip-meta">YOLOv8n + YuNet</span>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Detectar Pessoas</div>
+                <div class="row-sub">Classe COCO person + fallback facial YuNet</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="detectPerson" checked onchange="sendConfig()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Detectar Cachorros</div>
+                <div class="row-sub">Classe COCO dog</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="detectDog" checked onchange="sendConfig()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Rodar IA no Modo Manual</div>
+                <div class="row-sub">Desligado = menor latência no modo manual</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="detectInManual" onchange="sendConfig()">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Ponto de Mira</h2>
+            </div>
+            <div class="segmented-3" id="aimModeSeg">
+              <button type="button" data-val="head" class="seg-btn" onclick="setAimMode('head')">Cabeça (18%)</button>
+              <button type="button" data-val="upper" class="seg-btn" onclick="setAimMode('upper')">Peito (35%)</button>
+              <button type="button" data-val="center" class="seg-btn active" onclick="setAimMode('center')">Centro (50%)</button>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Sintonia do Rastreador</h2>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="kp">Velocidade / Ganho (Kp)</label>
+                <span class="mono-val" id="kpVal">1.00</span>
+              </div>
+              <input type="range" id="kp" min="0.20" max="1.50" step="0.05" value="1.00" oninput="updateLabels()" onchange="sendConfig()">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="deadzone">Zona Morta (Deadzone)</label>
+                <span class="mono-val" id="deadzoneVal">12 px</span>
+              </div>
+              <input type="range" id="deadzone" min="4" max="50" step="2" value="12" oninput="updateLabels()" onchange="sendConfig()">
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="conf">Confiança Mínima (YOLO)</label>
+                <span class="mono-val" id="confVal">0.28</span>
+              </div>
+              <input type="range" id="conf" min="0.18" max="0.80" step="0.01" value="0.28" oninput="updateLabels()" onchange="sendConfig()">
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 3: CAMERA & HARDWARE -->
+        <div id="tabHardware" class="tab-panel">
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Resolução da Câmera</h2>
+              <span class="chip-meta">res=0..5</span>
+            </div>
+
+            <div class="res-grid" id="resGrid">
+              <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)">
+                <strong>QVGA</strong><span>320×240</span>
+              </button>
+              <button type="button" class="res-btn" data-res="1" onclick="selectResolution(1)">
+                <strong>CIF</strong><span>400×296</span>
+              </button>
+              <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)">
+                <strong>VGA</strong><span>640×480</span>
+              </button>
+              <button type="button" class="res-btn active" data-res="3" onclick="selectResolution(3)">
+                <strong>SVGA</strong><span>800×600</span>
+              </button>
+              <button type="button" class="res-btn" data-res="4" onclick="selectResolution(4)">
+                <strong>XGA</strong><span>1024×768</span>
+              </button>
+              <button type="button" class="res-btn" data-res="5" onclick="selectResolution(5)">
+                <strong>UXGA</strong><span>1600×1200</span>
+              </button>
+            </div>
+            <p class="card-hint">Resoluções menores (QVGA/VGA) entregam maior FPS e resposta mais rápida no controle manual.</p>
+          </div>
+
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Orientação &amp; Calibração</h2>
+            </div>
+
+            <div class="field-block">
+              <label>Rotação do Vídeo</label>
+              <div class="segmented-4" id="rotationSeg">
+                <button type="button" data-rot="0" class="seg-btn" onclick="setRotation(0)">0°</button>
+                <button type="button" data-rot="90" class="seg-btn active" onclick="setRotation(90)">90°</button>
+                <button type="button" data-rot="180" class="seg-btn" onclick="setRotation(180)">180°</button>
+                <button type="button" data-rot="270" class="seg-btn" onclick="setRotation(270)">270°</button>
+              </div>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Inverter Eixo X</div>
+                <div class="row-sub">Servo 1 (IO14) — Pan horizontal</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="invX" onchange="sendConfig()">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Inverter Eixo Y</div>
+                <div class="row-sub">Servo 2 (IO13) — Tilt vertical</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="invY" onchange="sendConfig()">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="card-header">
+              <h2>Protocolo Unificado (Porta 80)</h2>
+              <span class="chip-meta">keep-alive</span>
+            </div>
+            <div class="proto-box">
+              <code id="protoPreview">GET /servo?x=90&amp;y=90&amp;led=0&amp;laser=0</code>
+            </div>
+            <div class="proto-meta">
+              <span>ESP32: <strong id="metaTurretUrl">—</strong></span>
+              <span id="metaHwError" class="proto-err"></span>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

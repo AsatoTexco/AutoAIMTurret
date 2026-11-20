@@ -1,13 +1,17 @@
+import json
 import math
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 try:
     import ncnn
@@ -20,13 +24,48 @@ except ImportError:
     ort = None
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_dotenv(env_path: str) -> None:
+    """Load key=value pairs from a local .env file without overriding existing env vars."""
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                os.environ.setdefault(key, val)
+    except OSError:
+        pass
+
+
+_load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 DEFAULT_TURRET_URL = os.environ.get("TURRET_URL", "http://192.168.100.5")
 DEFAULT_STREAM_URL = os.environ.get("STREAM_URL", "http://192.168.100.5:81/stream")
 DEFAULT_BACKEND = os.environ.get("AUTOAIM_BACKEND", "auto").lower()
 DEFAULT_CPU_THREADS = max(1, int(os.environ.get("AUTOAIM_CPU_THREADS", "4")))
 DEFAULT_MAX_FPS = float(os.environ.get("AUTOAIM_MAX_FPS", "20.0"))
+DEFAULT_DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+DEFAULT_DISCORD_COOLDOWN_S = max(5.0, float(os.environ.get("DISCORD_COOLDOWN_S", "30.0")))
+DEFAULT_DISCORD_ABSENCE_RESET_S = max(3.0, float(os.environ.get("DISCORD_ABSENCE_RESET_S", "15.0")))
+DEFAULT_DISCORD_CONNECT_TIMEOUT_S = max(3.0, float(os.environ.get("DISCORD_CONNECT_TIMEOUT_S", "10.0")))
+DEFAULT_DISCORD_READ_TIMEOUT_S = max(5.0, float(os.environ.get("DISCORD_READ_TIMEOUT_S", "25.0")))
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_YOLO_PATH = os.path.join(BASE_DIR, "models", "yolov8n.onnx")
 DEFAULT_YUNET_PATH = os.path.join(BASE_DIR, "models", "face_detection_yunet_2023mar.onnx")
 
@@ -47,6 +86,27 @@ SOURCE_LABELS = {
     "dog": "CACHORRO",
     "face": "ROSTO",
 }
+
+RESOLUTION_OPTIONS = {
+    0: ("QVGA", 320, 240),
+    1: ("CIF", 400, 296),
+    2: ("VGA", 640, 480),
+    3: ("SVGA", 800, 600),
+    4: ("XGA", 1024, 768),
+    5: ("UXGA", 1600, 1200),
+}
+
+
+def infer_resolution_code(width: int, height: int) -> int:
+    long_edge = max(width, height)
+    best_code = 3
+    best_diff = 10**9
+    for code, (_, rw, _) in RESOLUTION_OPTIONS.items():
+        diff = abs(long_edge - rw)
+        if diff < best_diff:
+            best_diff = diff
+            best_code = code
+    return best_code
 
 
 @dataclass
@@ -177,24 +237,45 @@ class MJPEGStreamReader:
 
 
 class TurretHardwareClient:
-    """Single-flight non-blocking HTTP client for ESP32-CAM pan/tilt servos and LED."""
+    """Single-flight non-blocking HTTP client for unified ESP32-CAM GET /servo control.
 
-    def __init__(self, base_url: str = DEFAULT_TURRET_URL) -> None:
+    Sends x, y, led, laser (and optional res when changed) together in a single
+    keep-alive request, dispatching only when state changes:
+      - 0 ms immediate priority when led, laser, or res changes
+      - 30 ms minimum interval when only x/y changes
+    """
+
+    MOVE_MIN_INTERVAL_S = 0.030
+
+    def __init__(self, base_url: str = DEFAULT_TURRET_URL, move_min_interval: float = MOVE_MIN_INTERVAL_S) -> None:
         self.base_url = base_url.rstrip("/")
+        self.move_min_interval = max(0.0, float(move_min_interval))
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wakeup_event = threading.Event()
+
         self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=2)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+        self._session.headers.update({"Connection": "keep-alive"})
 
         self._target_x: int = 90
         self._target_y: int = 90
         self._target_led: bool = False
+        self._target_laser: bool = False
+        self._target_res: Optional[int] = None
 
         self._sent_x: Optional[int] = None
         self._sent_y: Optional[int] = None
         self._sent_led: Optional[bool] = None
-        self._last_led_sent_time: float = 0.0
+        self._sent_laser: Optional[bool] = None
+        self._sent_res: Optional[int] = None
+
+        self._last_send_monotonic: float = 0.0
+        self._last_rtt_ms: float = 0.0
         self._last_error: str = ""
+        self._last_url: str = ""
         self._pose_history: List[Tuple[float, int, int]] = [(time.time(), 90, 90)]
 
         self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretHTTP")
@@ -206,36 +287,58 @@ class TurretHardwareClient:
             self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretHTTP")
             self._thread.start()
 
-    def set_angles(self, x: float, y: float) -> None:
-        ix = max(0, min(180, int(round(x))))
-        iy = max(0, min(180, int(round(y))))
+    def set_state(
+        self,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        led: Optional[bool] = None,
+        laser: Optional[bool] = None,
+        res: Optional[int] = None,
+    ) -> None:
+        changed = False
         with self._lock:
-            changed = ix != self._target_x or iy != self._target_y
-            self._target_x = ix
-            self._target_y = iy
+            if x is not None:
+                ix = max(0, min(180, int(round(x))))
+                if ix != self._target_x or ix != self._sent_x:
+                    self._target_x = ix
+                    changed = True
+            if y is not None:
+                iy = max(0, min(180, int(round(y))))
+                if iy != self._target_y or iy != self._sent_y:
+                    self._target_y = iy
+                    changed = True
+            if led is not None:
+                bled = bool(led)
+                if bled != self._target_led or bled != self._sent_led:
+                    self._target_led = bled
+                    changed = True
+            if laser is not None:
+                blaser = bool(laser)
+                if blaser != self._target_laser or blaser != self._sent_laser:
+                    self._target_laser = blaser
+                    changed = True
+            if res is not None:
+                ires = max(0, min(5, int(res)))
+                if ires != self._target_res or ires != self._sent_res:
+                    self._target_res = ires
+                    changed = True
         if changed:
             self._wakeup_event.set()
+
+    def set_angles(self, x: float, y: float) -> None:
+        self.set_state(x=x, y=y)
 
     def set_led(self, state: bool) -> None:
-        bstate = bool(state)
-        with self._lock:
-            changed = bstate != self._target_led
-            self._target_led = bstate
-        if changed:
-            self._wakeup_event.set()
+        self.set_state(led=state)
+
+    def set_laser(self, state: bool) -> None:
+        self.set_state(laser=state)
 
     def center(self) -> None:
-        self.set_angles(90, 90)
+        self.set_state(x=90, y=90)
 
-    def set_resolution(self, res_code: int) -> bool:
-        code = max(0, min(5, int(res_code)))
-        try:
-            r = self._session.get(f"{self.base_url}/servo", params={"res": code}, timeout=1.0)
-            return r.status_code == 200
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-            return False
+    def set_resolution(self, res_code: int) -> None:
+        self.set_state(res=res_code)
 
     def get_pose_at(self, timestamp: float) -> Tuple[float, float]:
         with self._lock:
@@ -253,10 +356,16 @@ class TurretHardwareClient:
                 "target_x": self._target_x,
                 "target_y": self._target_y,
                 "target_led": self._target_led,
+                "target_laser": self._target_laser,
+                "target_res": self._target_res,
                 "sent_x": self._sent_x,
                 "sent_y": self._sent_y,
                 "sent_led": self._sent_led,
+                "sent_laser": self._sent_laser,
+                "sent_res": self._sent_res,
+                "last_rtt_ms": round(self._last_rtt_ms, 1),
                 "last_error": self._last_error,
+                "last_url": self._last_url,
             }
 
     def shutdown(self) -> None:
@@ -265,7 +374,11 @@ class TurretHardwareClient:
         if self._thread.is_alive():
             self._thread.join(timeout=1.5)
         try:
-            self._session.get(f"{self.base_url}/servo", params={"led": 0}, timeout=0.8)
+            self._session.get(
+                f"{self.base_url}/servo",
+                params={"led": 0, "laser": 0},
+                timeout=0.8,
+            )
         except Exception:
             pass
         try:
@@ -275,59 +388,84 @@ class TurretHardwareClient:
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
-            now = time.time()
             with self._lock:
                 tx, ty = self._target_x, self._target_y
-                tled = self._target_led
+                tled, tlaser = self._target_led, self._target_laser
+                tres = self._target_res
                 sx, sy = self._sent_x, self._sent_y
-                sled = self._sent_led
-                last_led_t = self._last_led_sent_time
+                sled, slaser = self._sent_led, self._sent_laser
+                sres = self._sent_res
 
-            if tx != sx or ty != sy:
-                try:
-                    r = self._session.get(
-                        f"{self.base_url}/servo",
-                        params={"x": tx, "y": ty},
-                        timeout=0.8,
-                    )
-                    if r.status_code == 200:
-                        with self._lock:
-                            self._sent_x = tx
-                            self._sent_y = ty
-                            self._last_error = ""
-                            self._pose_history.append((time.time(), tx, ty))
-                            if len(self._pose_history) > 60:
-                                del self._pose_history[:-60]
-                except Exception as exc:
-                    with self._lock:
-                        self._last_error = str(exc)
+            priority_dirty = (
+                (tled != sled)
+                or (tlaser != slaser)
+                or (tres is not None and tres != sres)
+            )
+            move_dirty = (tx != sx) or (ty != sy)
 
-            need_led_update = (tled != sled) or (tled and (now - last_led_t >= 2.0))
-            if need_led_update and not self._stop_event.is_set():
-                try:
-                    r = self._session.get(
-                        f"{self.base_url}/servo",
-                        params={"led": 1 if tled else 0},
-                        timeout=0.8,
-                    )
-                    if r.status_code == 200:
-                        with self._lock:
-                            self._sent_led = tled
-                            self._last_led_sent_time = time.time()
-                            self._last_error = ""
-                except Exception as exc:
-                    with self._lock:
-                        self._last_error = str(exc)
-
-            with self._lock:
-                pending = (self._target_x != self._sent_x or self._target_y != self._sent_y) or (
-                    self._target_led != self._sent_led
-                )
-            if pending:
-                time.sleep(0.005)
-            else:
-                self._wakeup_event.wait(timeout=0.025)
+            if not priority_dirty and not move_dirty:
+                self._wakeup_event.wait(timeout=0.5)
                 self._wakeup_event.clear()
+                continue
+
+            if not priority_dirty and self.move_min_interval > 0.0:
+                elapsed = time.monotonic() - self._last_send_monotonic
+                remaining = self.move_min_interval - elapsed
+                if remaining > 0.0:
+                    self._wakeup_event.wait(timeout=remaining)
+                    self._wakeup_event.clear()
+                    continue
+
+            # Snapshot freshest desired state right before single-flight dispatch
+            with self._lock:
+                tx, ty = self._target_x, self._target_y
+                tled, tlaser = self._target_led, self._target_laser
+                tres = self._target_res
+                sres = self._sent_res
+
+            params: Dict[str, int] = {
+                "x": tx,
+                "y": ty,
+                "led": 1 if tled else 0,
+                "laser": 1 if tlaser else 0,
+            }
+            sending_res: Optional[int] = None
+            if tres is not None and tres != sres:
+                params["res"] = tres
+                sending_res = tres
+
+            t0 = time.monotonic()
+            try:
+                r = self._session.get(
+                    f"{self.base_url}/servo",
+                    params=params,
+                    timeout=0.8,
+                )
+                rtt_ms = (time.monotonic() - t0) * 1000.0
+                self._last_send_monotonic = time.monotonic()
+                if r.status_code == 200:
+                    with self._lock:
+                        self._sent_x = tx
+                        self._sent_y = ty
+                        self._sent_led = tled
+                        self._sent_laser = tlaser
+                        if sending_res is not None:
+                            self._sent_res = sending_res
+                        self._last_rtt_ms = rtt_ms
+                        self._last_error = ""
+                        self._last_url = r.url
+                        self._pose_history.append((time.time(), tx, ty))
+                        if len(self._pose_history) > 60:
+                            del self._pose_history[:-60]
+                else:
+                    with self._lock:
+                        self._last_error = f"HTTP {r.status_code}"
+                    self._stop_event.wait(timeout=0.15)
+            except Exception as exc:
+                self._last_send_monotonic = time.monotonic()
+                with self._lock:
+                    self._last_error = str(exc)
+                self._stop_event.wait(timeout=0.25)
 
 
 class PersonDetector:
@@ -483,6 +621,7 @@ class PersonDetector:
         conf_threshold: float = 0.35,
         detect_person: bool = True,
         detect_dog: bool = False,
+        force_fallback: bool = False,
     ) -> List[Detection]:
         if not detect_person and not detect_dog:
             return []
@@ -499,7 +638,7 @@ class PersonDetector:
             return detections
 
         self._empty_count += 1
-        if detect_person and self._yunet is not None and (self._empty_count % 3 == 0):
+        if detect_person and self._yunet is not None and (force_fallback or (self._empty_count % 3 == 0)):
             detections = self._detect_yunet_face(frame)
         return detections
 
@@ -647,9 +786,573 @@ class PersonDetector:
             ty = (det.y1 + det.y2) * 0.5
         return (tx, ty)
 
+    def detect_face_in_crop(self, frame: np.ndarray, det: Detection) -> Optional[Detection]:
+        """Run YuNet on the upper-body crop of a detected person to locate the exact face."""
+        if det.source == "face":
+            return det
+        if det.source != "person" or self._yunet is None:
+            return None
+
+        h, w = frame.shape[:2]
+        bw = max(1.0, det.x2 - det.x1)
+        bh = max(1.0, det.y2 - det.y1)
+        pad_x = bw * 0.12
+        pad_top = bh * 0.10
+        sub_h = bh * 0.65 if bh > (bw * 1.4) else bh
+
+        x1 = max(0, int(math.floor(det.x1 - pad_x)))
+        y1 = max(0, int(math.floor(det.y1 - pad_top)))
+        x2 = min(w, int(math.ceil(det.x2 + pad_x)))
+        y2 = min(h, int(math.ceil(det.y1 + sub_h)))
+        cw, ch = x2 - x1, y2 - y1
+        if cw < 24 or ch < 24:
+            return None
+
+        crop = np.ascontiguousarray(frame[y1:y2, x1:x2])
+        self._yunet.setInputSize((cw, ch))
+        _, faces = self._yunet.detect(crop)
+        if faces is None or len(faces) == 0:
+            return None
+
+        best_face = max(faces, key=lambda f: float(f[14]) if len(f) > 14 else 0.7)
+        fx, fy, fw, fh = float(best_face[0]), float(best_face[1]), float(best_face[2]), float(best_face[3])
+        score = float(best_face[14]) if len(best_face) > 14 else 0.7
+        gx1 = max(0.0, min(w - 1.0, x1 + fx))
+        gy1 = max(0.0, min(h - 1.0, y1 + fy))
+        gx2 = max(0.0, min(w - 1.0, x1 + fx + fw))
+        gy2 = max(0.0, min(h - 1.0, y1 + fy + fh))
+        if (gx2 - gx1) < 8.0 or (gy2 - gy1) < 8.0:
+            return None
+        return Detection(x1=gx1, y1=gy1, x2=gx2, y2=gy2, conf=score, source="face")
+
+
+class DiscordWebhookLogger:
+    """Anti-spam Best-Shot visit logger that posts face/person captures asynchronously to Discord."""
+
+    def __init__(
+        self,
+        webhook_url: str = DEFAULT_DISCORD_WEBHOOK_URL,
+        cooldown_s: float = DEFAULT_DISCORD_COOLDOWN_S,
+        absence_reset_s: float = DEFAULT_DISCORD_ABSENCE_RESET_S,
+        connect_timeout_s: float = DEFAULT_DISCORD_CONNECT_TIMEOUT_S,
+        read_timeout_s: float = DEFAULT_DISCORD_READ_TIMEOUT_S,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._queue: "queue.Queue[Optional[Dict[str, object]]]" = queue.Queue(maxsize=4)
+
+        self._webhook_url: str = str(webhook_url or "").strip()
+        self.enabled: bool = bool(self._webhook_url)
+        self.cooldown_s: float = max(5.0, min(600.0, float(cooldown_s)))
+        self.absence_reset_s: float = max(3.0, min(300.0, float(absence_reset_s)))
+        self.connect_timeout_s: float = max(3.0, float(connect_timeout_s))
+        self.read_timeout_s: float = max(5.0, float(read_timeout_s))
+        self.best_shot_window_s: float = 2.5
+        self.min_confirm_frames: int = 3
+        self.include_scene: bool = True
+        self.log_dogs: bool = False
+
+        # Visit session state machine: idle -> collecting -> logged
+        self._state: str = "idle"
+        self._confirm_streak: int = 0
+        self._window_end: float = 0.0
+        self._last_seen_at: float = 0.0
+        self._last_eval_at: float = 0.0
+        self._last_sent_at: float = -1e9
+        self._best_candidate: Optional[Dict[str, object]] = None
+
+        # Telemetry
+        self._sent_count: int = 0
+        self._last_sent_wall_ts: float = 0.0
+        self._last_error: str = ""
+
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="DiscordWebhook")
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="DiscordWebhook")
+            self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    @staticmethod
+    def _new_http_session() -> requests.Session:
+        sess = requests.Session()
+        sess.headers.update(
+            {
+                "User-Agent": "AutoAIM-Turret/1.0",
+                "Connection": "close",
+            }
+        )
+        return sess
+
+    def update_config(self, cfg: Dict[str, object]) -> None:
+        with self._lock:
+            if "discord_enabled" in cfg:
+                self.enabled = bool(cfg["discord_enabled"])
+                if not self.enabled:
+                    self._reset_session_locked()
+            if "discord_cooldown_s" in cfg:
+                self.cooldown_s = max(5.0, min(600.0, float(cfg["discord_cooldown_s"])))
+            if "discord_absence_reset_s" in cfg:
+                self.absence_reset_s = max(3.0, min(300.0, float(cfg["discord_absence_reset_s"])))
+            if "discord_include_scene" in cfg:
+                self.include_scene = bool(cfg["discord_include_scene"])
+            if "discord_log_dogs" in cfg:
+                self.log_dogs = bool(cfg["discord_log_dogs"])
+
+    def _reset_session_locked(self) -> None:
+        self._state = "idle"
+        self._confirm_streak = 0
+        self._window_end = 0.0
+        self._last_eval_at = 0.0
+        self._best_candidate = None
+
+    def is_eligible_target(self, target: Optional[Detection], log_dogs: Optional[bool] = None) -> bool:
+        if target is None:
+            return False
+        allow_dogs = self.log_dogs if log_dogs is None else log_dogs
+        return target.source in ("person", "face") or (allow_dogs and target.source == "dog")
+
+    def needs_face_check(self, target: Optional[Detection], now: float) -> bool:
+        with self._lock:
+            if not self.enabled or not self._webhook_url:
+                return False
+            if not self.is_eligible_target(target, self.log_dogs):
+                return False
+            if target is not None and target.source == "face":
+                return False
+            if self._state == "idle":
+                return (
+                    (self._confirm_streak + 1 >= self.min_confirm_frames)
+                    and ((now - self._last_sent_at) >= self.cooldown_s)
+                )
+            if self._state == "collecting":
+                return (self._best_candidate is None) or ((now - self._last_eval_at) >= 0.20)
+            return False
+
+    @staticmethod
+    def _extract_crop(frame: np.ndarray, target: Detection, face_det: Optional[Detection]) -> Tuple[np.ndarray, bool]:
+        """Crop the face region (with head/shoulder margin) or upper-body fallback cleanly."""
+        h, w = frame.shape[:2]
+        if not hasattr(frame, "__getitem__"):
+            return frame.copy(), face_det is not None
+
+        if face_det is not None:
+            fw = max(12.0, face_det.x2 - face_det.x1)
+            fh = max(12.0, face_det.y2 - face_det.y1)
+            mx = fw * 0.45
+            my_top = fh * 0.40
+            my_bot = fh * 0.55
+            x1 = max(0, int(math.floor(face_det.x1 - mx)))
+            y1 = max(0, int(math.floor(face_det.y1 - my_top)))
+            x2 = min(w, int(math.ceil(face_det.x2 + mx)))
+            y2 = min(h, int(math.ceil(face_det.y2 + my_bot)))
+            has_face = True
+        else:
+            bw = max(16.0, target.x2 - target.x1)
+            bh = max(16.0, target.y2 - target.y1)
+            if target.source == "person" and bh > (bw * 1.3):
+                crop_h = bh * 0.55
+                mx = bw * 0.18
+                my = crop_h * 0.15
+                x1 = max(0, int(math.floor(target.x1 - mx)))
+                y1 = max(0, int(math.floor(target.y1 - my)))
+                x2 = min(w, int(math.ceil(target.x2 + mx)))
+                y2 = min(h, int(math.ceil(target.y1 + crop_h)))
+            else:
+                mx = bw * 0.20
+                my = bh * 0.20
+                x1 = max(0, int(math.floor(target.x1 - mx)))
+                y1 = max(0, int(math.floor(target.y1 - my)))
+                x2 = min(w, int(math.ceil(target.x2 + mx)))
+                y2 = min(h, int(math.ceil(target.y2 + my)))
+            has_face = False
+
+        if x2 <= x1 + 4 or y2 <= y1 + 4:
+            return frame.copy(), has_face
+        return frame[y1:y2, x1:x2].copy(), has_face
+
+    @staticmethod
+    def _compute_sharpness(crop: np.ndarray) -> float:
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            lap = cv2.Laplacian(gray, cv2.CV_64F)
+            return float(lap.var())
+        except Exception:
+            return 50.0
+
+    def _evaluate_candidate(
+        self,
+        frame: np.ndarray,
+        target: Detection,
+        face_det: Optional[Detection],
+        servo_x: int,
+        servo_y: int,
+        led_on: bool,
+        laser_on: bool,
+        include_scene: bool,
+    ) -> Dict[str, object]:
+        crop, has_face = self._extract_crop(frame, target, face_det)
+        sharpness = self._compute_sharpness(crop)
+        h, w = frame.shape[:2]
+        frame_area = float(max(1, h * w))
+        ref_det = face_det if face_det is not None else target
+        area_ratio = min(1.0, ref_det.area / frame_area)
+        conf = face_det.conf if face_det is not None else target.conf
+        score = (
+            (1000.0 if has_face else 0.0)
+            + (conf * 120.0)
+            + min(250.0, sharpness * 0.4)
+            + min(150.0, math.sqrt(area_ratio) * 200.0)
+        )
+        source_kind = "face" if has_face else target.source
+        return {
+            "kind": "capture",
+            "score": score,
+            "source": source_kind,
+            "conf": conf,
+            "has_face": has_face,
+            "servo_x": servo_x,
+            "servo_y": servo_y,
+            "led_on": led_on,
+            "laser_on": laser_on,
+            "crop": crop,
+            "scene": frame.copy() if include_scene else None,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _enqueue_job(self, job: Dict[str, object]) -> bool:
+        try:
+            self._queue.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+    def observe(
+        self,
+        frame: np.ndarray,
+        target: Optional[Detection],
+        face_det: Optional[Detection],
+        servo_x: int,
+        servo_y: int,
+        led_on: bool,
+        laser_on: bool,
+        now: Optional[float] = None,
+    ) -> None:
+        now = time.time() if now is None else now
+        job_to_send: Optional[Dict[str, object]] = None
+
+        with self._lock:
+            if not self.enabled or not self._webhook_url:
+                self._reset_session_locked()
+                return
+
+            eligible = self.is_eligible_target(target, self.log_dogs)
+
+            if self._state == "idle":
+                if eligible and target is not None:
+                    self._confirm_streak += 1
+                    self._last_seen_at = now
+                    if (
+                        self._confirm_streak >= self.min_confirm_frames
+                        and (now - self._last_sent_at) >= self.cooldown_s
+                    ):
+                        self._state = "collecting"
+                        self._window_end = now + self.best_shot_window_s
+                        self._last_eval_at = now
+                        self._best_candidate = self._evaluate_candidate(
+                            frame=frame,
+                            target=target,
+                            face_det=face_det,
+                            servo_x=servo_x,
+                            servo_y=servo_y,
+                            led_on=led_on,
+                            laser_on=laser_on,
+                            include_scene=self.include_scene,
+                        )
+                else:
+                    self._confirm_streak = 0
+
+            elif self._state == "collecting":
+                if eligible and target is not None:
+                    self._last_seen_at = now
+                    if self._best_candidate is None or (now - self._last_eval_at) >= 0.20:
+                        self._last_eval_at = now
+                        cand = self._evaluate_candidate(
+                            frame=frame,
+                            target=target,
+                            face_det=face_det,
+                            servo_x=servo_x,
+                            servo_y=servo_y,
+                            led_on=led_on,
+                            laser_on=laser_on,
+                            include_scene=self.include_scene,
+                        )
+                        if self._best_candidate is None or cand["score"] > self._best_candidate["score"]:
+                            self._best_candidate = cand
+
+                lost_s = now - self._last_seen_at
+                if now >= self._window_end or (not eligible and lost_s >= 1.0):
+                    if self._best_candidate is not None:
+                        job_to_send = self._best_candidate
+                        self._best_candidate = None
+                        self._last_sent_at = now
+                        self._state = "logged"
+                    else:
+                        self._reset_session_locked()
+
+            elif self._state == "logged":
+                if eligible:
+                    self._last_seen_at = now
+                elif (now - self._last_seen_at) >= self.absence_reset_s:
+                    self._reset_session_locked()
+
+        if job_to_send is not None:
+            self._enqueue_job(job_to_send)
+
+    def send_test(
+        self,
+        frame: Optional[np.ndarray],
+        servo_x: int,
+        servo_y: int,
+        led_on: bool,
+        laser_on: bool,
+    ) -> Tuple[bool, str]:
+        with self._lock:
+            if not self._webhook_url:
+                return False, "DISCORD_WEBHOOK_URL não configurada no .env"
+            job: Dict[str, object] = {
+                "kind": "test",
+                "source": "test",
+                "conf": 1.0,
+                "has_face": False,
+                "servo_x": servo_x,
+                "servo_y": servo_y,
+                "led_on": led_on,
+                "laser_on": laser_on,
+                "crop": frame.copy() if frame is not None else None,
+                "scene": None,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        if not self._enqueue_job(job):
+            return False, "Fila de envio do Discord cheia; tente novamente"
+        return True, "Teste enfileirado para envio no Discord"
+
+    @staticmethod
+    def _encode_jpeg(
+        img: Optional[np.ndarray],
+        quality: int = 85,
+        max_dim: Optional[int] = None,
+    ) -> Optional[bytes]:
+        if img is None:
+            return None
+        try:
+            target_img = img
+            if max_dim is not None and max_dim > 0 and hasattr(img, "shape") and len(img.shape) >= 2:
+                h, w = int(img.shape[0]), int(img.shape[1])
+                long_edge = max(h, w)
+                if long_edge > max_dim:
+                    scale = float(max_dim) / float(long_edge)
+                    nw = max(1, int(round(w * scale)))
+                    nh = max(1, int(round(h * scale)))
+                    target_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".jpg", target_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if ok:
+                return encoded.tobytes()
+        except Exception:
+            return None
+        return None
+
+    def _post_job(self, url: str, job: Dict[str, object]) -> None:
+        kind = str(job.get("kind", "capture"))
+        source = str(job.get("source", "person"))
+        conf = float(job.get("conf", 0.0))
+        servo_x = int(job.get("servo_x", 90))
+        servo_y = int(job.get("servo_y", 90))
+        led_on = bool(job.get("led_on", False))
+        laser_on = bool(job.get("laser_on", False))
+        ts_iso = str(job.get("timestamp_utc", datetime.now(timezone.utc).isoformat()))
+
+        if kind == "test":
+            title = "Teste de Conexão — AutoAIM Turret"
+            color = 0x5865F2
+            target_label = "Teste Manual"
+        elif source == "face":
+            title = "Rosto Registrado — AutoAIM"
+            color = 0x22C55E
+            target_label = "ROSTO"
+        elif source == "dog":
+            title = "Cachorro Detectado — AutoAIM"
+            color = 0xF59E0B
+            target_label = "CACHORRO"
+        else:
+            title = "Pessoa Detectada — AutoAIM"
+            color = 0x38BDF8
+            target_label = "PESSOA"
+
+        light_label = "Flash ON" if led_on else "Ambiente"
+        if laser_on:
+            light_label += " · Laser ON"
+
+        embed_base: Dict[str, object] = {
+            "title": title,
+            "color": color,
+            "timestamp": ts_iso,
+            "fields": [
+                {"name": "Alvo", "value": target_label, "inline": True},
+                {"name": "Confiança", "value": f"{conf * 100:.0f}%", "inline": True},
+                {"name": "Posição", "value": f"X {servo_x}° · Y {servo_y}°", "inline": True},
+                {"name": "Iluminação", "value": light_label, "inline": True},
+            ],
+            "footer": {"text": "AutoAIM Turret · Log Anti-Spam"},
+        }
+
+        crop_bytes = self._encode_jpeg(job.get("crop"), quality=85, max_dim=640)  # type: ignore[arg-type]
+        scene_bytes = self._encode_jpeg(job.get("scene"), quality=78, max_dim=960)  # type: ignore[arg-type]
+
+        def _build_request_parts(include_scene_attachment: bool):
+            embed_main = dict(embed_base)
+            embeds = [embed_main]
+            files = []
+            if crop_bytes is not None:
+                embed_main["image"] = {"url": "attachment://capture.jpg"}
+                files.append(("files[0]", ("capture.jpg", crop_bytes, "image/jpeg")))
+                if include_scene_attachment and scene_bytes is not None:
+                    embeds.append(
+                        {
+                            "title": "Cena Completa",
+                            "color": color,
+                            "image": {"url": "attachment://scene.jpg"},
+                        }
+                    )
+                    files.append(("files[1]", ("scene.jpg", scene_bytes, "image/jpeg")))
+            return {"embeds": embeds}, files
+
+        max_attempts = 3
+        had_timeout = False
+        timeout = (self.connect_timeout_s, self.read_timeout_s)
+
+        for attempt in range(max_attempts):
+            if self._stop_event.is_set():
+                return
+
+            include_scene_att = not (had_timeout and attempt == max_attempts - 1)
+            payload, files = _build_request_parts(include_scene_att)
+
+            try:
+                with self._new_http_session() as session:
+                    if files:
+                        resp = session.post(
+                            url,
+                            data={"payload_json": json.dumps(payload)},
+                            files=files,
+                            timeout=timeout,
+                        )
+                    else:
+                        resp = session.post(url, json=payload, timeout=timeout)
+
+                    try:
+                        status_code = resp.status_code
+                        if 200 <= status_code < 300:
+                            with self._lock:
+                                self._sent_count += 1
+                                self._last_sent_wall_ts = time.time()
+                                self._last_error = ""
+                            return
+
+                        if status_code == 429 and attempt < max_attempts - 1:
+                            retry_s = 2.0
+                            try:
+                                retry_s = float((resp.json() or {}).get("retry_after", 2.0))
+                            except Exception:
+                                pass
+                            if self._stop_event.wait(timeout=max(0.5, min(10.0, retry_s))):
+                                return
+                            continue
+
+                        if 500 <= status_code < 600 and attempt < max_attempts - 1:
+                            if self._stop_event.wait(timeout=1.5 * (attempt + 1)):
+                                return
+                            continue
+
+                        with self._lock:
+                            self._last_error = f"HTTP {status_code}"
+                        return
+                    finally:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+            except requests.exceptions.Timeout as exc:
+                had_timeout = True
+                if attempt < max_attempts - 1:
+                    if self._stop_event.wait(timeout=1.5 * (attempt + 1)):
+                        return
+                    continue
+                if isinstance(exc, requests.exceptions.ConnectTimeout):
+                    err_msg = f"Timeout conexão Discord ({self.connect_timeout_s:.0f}s)"
+                else:
+                    err_msg = f"Timeout leitura Discord ({self.read_timeout_s:.0f}s)"
+                with self._lock:
+                    self._last_error = err_msg
+                return
+            except requests.exceptions.ConnectionError as exc:
+                if attempt < max_attempts - 1:
+                    if self._stop_event.wait(timeout=1.5 * (attempt + 1)):
+                        return
+                    continue
+                with self._lock:
+                    self._last_error = f"Erro conexão Discord: {exc}"
+                return
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
+                return
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                job = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if job is None:
+                self._queue.task_done()
+                break
+            try:
+                with self._lock:
+                    url = self._webhook_url
+                if url:
+                    self._post_job(url, job)
+            finally:
+                self._queue.task_done()
+
+    def get_status(self) -> Dict[str, object]:
+        with self._lock:
+            return {
+                "discord_configured": bool(self._webhook_url),
+                "discord_enabled": self.enabled,
+                "discord_cooldown_s": round(self.cooldown_s, 1),
+                "discord_absence_reset_s": round(self.absence_reset_s, 1),
+                "discord_include_scene": self.include_scene,
+                "discord_log_dogs": self.log_dogs,
+                "discord_sent_count": self._sent_count,
+                "discord_last_sent_ts": round(self._last_sent_wall_ts, 3) if self._last_sent_wall_ts > 0 else 0,
+                "discord_last_error": self._last_error,
+                "discord_state": self._state,
+            }
+
 
 class AutoAimEngine:
-    """Closed-loop visual servoing engine that tracks targets (person/dog) and controls the turret LED."""
+    """Closed-loop visual servoing engine that tracks targets (person/dog) and controls servos, Flash LED, and Green Laser."""
 
     def __init__(
         self,
@@ -660,6 +1363,7 @@ class AutoAimEngine:
         self.reader = MJPEGStreamReader(stream_url=stream_url, rotation=90)
         self.hardware = TurretHardwareClient(base_url=turret_url)
         self.detector = PersonDetector()
+        self.discord = DiscordWebhookLogger()
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -669,7 +1373,19 @@ class AutoAimEngine:
         self.auto_aim: bool = auto_aim
         self.detect_person: bool = True
         self.detect_dog: bool = True
+        self.detect_in_manual: bool = False
+        self.eco_mode: bool = True
+        self.eco_delay_s: float = 15.0
+        self.eco_fps: float = 1.0
+        self.eco_motion_wake: bool = True
+        self.eco_motion_flash: bool = True
+        self.eco_flash_dark_only: bool = False
+        self.eco_motion_sensitivity: float = 50.0
+        self.eco_flash_duration_s: float = 6.0
+        self.eco_dark_threshold: float = 80.0
         self.auto_fire: bool = True
+        self.auto_fire_laser: bool = True
+        self.auto_fire_led: bool = False
         self.aim_mode: str = "center"  # center | upper | head
         self.led_mode: str = "on_lock"  # on_lock | on_detect | off
         self.kp: float = 1.0
@@ -678,86 +1394,218 @@ class AutoAimEngine:
         self.conf_threshold: float = 0.28
         self.invert_x: bool = False
         self.invert_y: bool = False
+        self.resolution: int = 3  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=XGA, 5=UXGA
+        self._res_explicit: bool = False
         self.max_step_deg: float = 45.0
-        self.min_servo_interval: float = 0.04
+        self.min_servo_interval: float = 0.03
         self.camera_latency: float = 0.17
         self.hold_timeout: float = 0.45
 
-        # Internal servo & tracking state
+        # Internal servo, actuator & tracking state
         self._curr_x: float = 90.0
         self._curr_y: float = 90.0
+        self._manual_led: bool = False
+        self._manual_laser: bool = False
+        self._auto_fire_active: bool = False
         self._prev_deg_err_x: float = 0.0
         self._prev_deg_err_y: float = 0.0
         self._last_servo_step_time: float = 0.0
         self._wait_frame_after: float = 0.0
         self._last_detection_time: float = 0.0
+        self._last_cv_activity_time: float = time.time()
+        self._eco_active: bool = False
+        self._eco_wake_until: float = 0.0
+        self._eco_flash_until: float = 0.0
+        self._eco_flash_active: bool = False
+        self._motion_prev_gray: Optional[np.ndarray] = None
+        self._motion_suppress_until: float = 0.0
+        self._motion_score: float = 0.0
+        self._ambient_luma: float = 0.0
         self._smoothed_target: Optional[Tuple[float, float]] = None
 
         # Telemetry & output frames
         self._person_detected: bool = False
         self._target_type: Optional[str] = None
         self._led_on: bool = False
+        self._laser_on: bool = False
         self._target_box: Optional[List[int]] = None
         self._target_center: Optional[List[int]] = None
         self._error_px: List[int] = [0, 0]
+        self._frame_size: List[int] = [0, 0]
         self._fps: float = 0.0
+        self._cv_fps: float = 0.0
+        self._video_fps: float = 0.0
         self._inference_ms: float = 0.0
         self._detections_count: int = 0
 
         self._annotated_frame: Optional[np.ndarray] = None
         self._annotated_jpeg: Optional[bytes] = None
         self._annotated_id: int = 0
+        self._frame_cond = threading.Condition()
+
+    def _sync_hardware_locked(self, res: Optional[int] = None) -> None:
+        """Compute effective Flash LED & Green Laser states and push unified state to hardware."""
+        fire_allowed = self.auto_aim and self.auto_fire and (self.led_mode != "off")
+        auto_firing = fire_allowed and self._auto_fire_active
+        effective_led = self._manual_led or (auto_firing and self.auto_fire_led) or self._eco_flash_active
+        effective_laser = self._manual_laser or (auto_firing and self.auto_fire_laser)
+        self._led_on = effective_led
+        self._laser_on = effective_laser
+        self.hardware.set_state(
+            x=self._curr_x,
+            y=self._curr_y,
+            led=effective_led,
+            laser=effective_laser,
+            res=res,
+        )
 
     def start(self) -> None:
         self.hardware.start()
-        self.hardware.center()
-        self.hardware.set_led(False)
+        self.discord.start()
+        with self._lock:
+            now = time.time()
+            self._curr_x = 90.0
+            self._curr_y = 90.0
+            self._manual_led = False
+            self._manual_laser = False
+            self._auto_fire_active = False
+            self._last_cv_activity_time = now
+            self._eco_active = False
+            self._eco_wake_until = 0.0
+            self._eco_flash_until = 0.0
+            self._eco_flash_active = False
+            self._motion_prev_gray = None
+            self._motion_suppress_until = now + 1.5
+            self._sync_hardware_locked()
         self.reader.start()
         if not self._thread.is_alive():
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True, name="AutoAimEngine")
             self._thread.start()
 
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
     def stop(self) -> None:
         self._stop_event.set()
+        with self._frame_cond:
+            self._frame_cond.notify_all()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self.reader.stop()
+        self.discord.shutdown()
         self.hardware.shutdown()
 
     def update_config(self, cfg: Dict[str, object]) -> None:
         with self._lock:
+            hw_res: Optional[int] = None
+            hw_dirty = False
+            now = time.time()
             if "auto_aim" in cfg:
                 new_auto = bool(cfg["auto_aim"])
                 if new_auto != self.auto_aim:
                     self.auto_aim = new_auto
                     self._prev_deg_err_x = 0.0
                     self._prev_deg_err_y = 0.0
-                    if not new_auto:
-                        self._led_on = False
-                        self.hardware.set_led(False)
+                    if new_auto:
+                        self._last_cv_activity_time = now
+                        self._eco_active = False
+                        self._eco_wake_until = 0.0
+                    else:
+                        self._auto_fire_active = False
+                        self._smoothed_target = None
+                        self._eco_wake_until = 0.0
+                        self._eco_flash_until = 0.0
+                        self._eco_flash_active = False
+                        if not self.detect_in_manual:
+                            self._eco_active = False
+                        hw_dirty = True
             if "detect_person" in cfg:
                 new_dp = bool(cfg["detect_person"])
                 if new_dp != self.detect_person:
                     self.detect_person = new_dp
                     self._smoothed_target = None
+                    if new_dp:
+                        self._last_cv_activity_time = now
             if "detect_dog" in cfg:
                 new_dd = bool(cfg["detect_dog"])
                 if new_dd != self.detect_dog:
                     self.detect_dog = new_dd
                     self._smoothed_target = None
+                    if new_dd:
+                        self._last_cv_activity_time = now
+            if "detect_in_manual" in cfg:
+                new_dim = bool(cfg["detect_in_manual"])
+                if new_dim != self.detect_in_manual:
+                    self.detect_in_manual = new_dim
+                    if new_dim:
+                        self._last_cv_activity_time = now
+                        self._eco_active = False
+                    elif not self.auto_aim:
+                        self._eco_active = False
+            if "eco_mode" in cfg:
+                new_eco = bool(cfg["eco_mode"])
+                if new_eco != self.eco_mode:
+                    self.eco_mode = new_eco
+                    if new_eco:
+                        self._last_cv_activity_time = now
+                    else:
+                        self._eco_active = False
+                        self._eco_wake_until = 0.0
+                        if self._eco_flash_active:
+                            self._eco_flash_active = False
+                            self._eco_flash_until = 0.0
+                            hw_dirty = True
+            if "eco_delay_s" in cfg:
+                self.eco_delay_s = max(3.0, min(300.0, float(cfg["eco_delay_s"])))
+            if "eco_fps" in cfg:
+                self.eco_fps = max(0.2, min(10.0, float(cfg["eco_fps"])))
+            if "eco_motion_wake" in cfg:
+                new_mw = bool(cfg["eco_motion_wake"])
+                if new_mw != self.eco_motion_wake:
+                    self.eco_motion_wake = new_mw
+                    self._motion_prev_gray = None
+                    if not new_mw:
+                        self._eco_wake_until = 0.0
+                        if self._eco_flash_active:
+                            self._eco_flash_active = False
+                            self._eco_flash_until = 0.0
+                            hw_dirty = True
+            if "eco_motion_flash" in cfg:
+                new_mf = bool(cfg["eco_motion_flash"])
+                if new_mf != self.eco_motion_flash:
+                    self.eco_motion_flash = new_mf
+                    if not new_mf and self._eco_flash_active:
+                        self._eco_flash_active = False
+                        self._eco_flash_until = 0.0
+                        hw_dirty = True
+            if "eco_flash_dark_only" in cfg:
+                self.eco_flash_dark_only = bool(cfg["eco_flash_dark_only"])
+            if "eco_motion_sensitivity" in cfg:
+                self.eco_motion_sensitivity = max(10.0, min(100.0, float(cfg["eco_motion_sensitivity"])))
+            if "eco_flash_duration_s" in cfg:
+                self.eco_flash_duration_s = max(2.0, min(30.0, float(cfg["eco_flash_duration_s"])))
+            if "eco_dark_threshold" in cfg:
+                self.eco_dark_threshold = max(15.0, min(200.0, float(cfg["eco_dark_threshold"])))
             if "auto_fire" in cfg:
                 self.auto_fire = bool(cfg["auto_fire"])
                 if not self.auto_fire:
-                    self._led_on = False
-                    self.hardware.set_led(False)
+                    self._auto_fire_active = False
+                hw_dirty = True
+            if "auto_fire_laser" in cfg:
+                self.auto_fire_laser = bool(cfg["auto_fire_laser"])
+                hw_dirty = True
+            if "auto_fire_led" in cfg:
+                self.auto_fire_led = bool(cfg["auto_fire_led"])
+                hw_dirty = True
             if "aim_mode" in cfg and cfg["aim_mode"] in ("center", "upper", "head"):
                 self.aim_mode = str(cfg["aim_mode"])
-            if "led_mode" in cfg and cfg["led_mode"] in ("on_lock", "on_detect", "off"):
-                self.led_mode = str(cfg["led_mode"])
+            mode_val = cfg.get("fire_mode", cfg.get("led_mode"))
+            if mode_val in ("on_lock", "on_detect", "off"):
+                self.led_mode = str(mode_val)
                 if self.led_mode == "off":
-                    self._led_on = False
-                    self.hardware.set_led(False)
+                    self._auto_fire_active = False
+                hw_dirty = True
             if "kp" in cfg:
                 self.kp = max(0.2, min(2.0, float(cfg["kp"])))
             if "kd" in cfg:
@@ -774,73 +1622,240 @@ class AutoAimEngine:
                 rot = int(cfg["rotation"])
                 if rot in ROTATION_CODES:
                     self.reader.set_rotation(rot)
+                    self._motion_prev_gray = None
+                    self._motion_suppress_until = max(self._motion_suppress_until, now + 1.0)
+            if "resolution" in cfg and cfg["resolution"] is not None:
+                res_code = max(0, min(5, int(cfg["resolution"])))
+                self.resolution = res_code
+                self._res_explicit = True
+                hw_res = res_code
+                hw_dirty = True
+                self._motion_prev_gray = None
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+
+            if hw_dirty:
+                self._motion_prev_gray = None
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                self._sync_hardware_locked(res=hw_res)
+
+        self.discord.update_config(cfg)
+
+    def apply_servo_command(
+        self,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        led: Optional[bool] = None,
+        laser: Optional[bool] = None,
+        res: Optional[int] = None,
+        disable_auto_aim: bool = False,
+    ) -> None:
+        """Apply unified /servo parameters atomically in a single hardware dispatch."""
+        with self._lock:
+            now = time.time()
+            if disable_auto_aim and self.auto_aim:
+                self.auto_aim = False
+                self._auto_fire_active = False
+                self._smoothed_target = None
+                self._prev_deg_err_x = 0.0
+                self._prev_deg_err_y = 0.0
+                self._eco_wake_until = 0.0
+                self._eco_flash_until = 0.0
+                self._eco_flash_active = False
+                if not self.detect_in_manual:
+                    self._eco_active = False
+            if x is not None:
+                self._curr_x = max(0.0, min(180.0, float(x)))
+                self._prev_deg_err_x = 0.0
+                self._wait_frame_after = now + 0.12
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                self._motion_prev_gray = None
+            if y is not None:
+                self._curr_y = max(0.0, min(180.0, float(y)))
+                self._prev_deg_err_y = 0.0
+                self._wait_frame_after = now + 0.12
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                self._motion_prev_gray = None
+            if led is not None:
+                self._manual_led = bool(led)
+                if not self._manual_led and self._eco_flash_active:
+                    self._eco_flash_active = False
+                    self._eco_flash_until = 0.0
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+                self._motion_prev_gray = None
+            if laser is not None:
+                self._manual_laser = bool(laser)
+            res_code: Optional[int] = None
+            if res is not None:
+                res_code = max(0, min(5, int(res)))
+                self.resolution = res_code
+                self._res_explicit = True
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                self._motion_prev_gray = None
+            self._sync_hardware_locked(res=res_code)
 
     def center_turret(self) -> None:
         with self._lock:
+            now = time.time()
             self._curr_x = 90.0
             self._curr_y = 90.0
             self._prev_deg_err_x = 0.0
             self._prev_deg_err_y = 0.0
             self._smoothed_target = None
-            self._wait_frame_after = time.time() + 0.12
-        self.hardware.center()
+            self._wait_frame_after = now + 0.12
+            self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+            self._motion_prev_gray = None
+            self._sync_hardware_locked()
 
     def set_manual_angles(self, x: float, y: float) -> None:
-        cx = max(0.0, min(180.0, float(x)))
-        cy = max(0.0, min(180.0, float(y)))
-        with self._lock:
-            self._curr_x = cx
-            self._curr_y = cy
-            self._prev_deg_err_x = 0.0
-            self._prev_deg_err_y = 0.0
-            self._wait_frame_after = time.time() + 0.12
-        self.hardware.set_angles(cx, cy)
+        self.apply_servo_command(x=x, y=y)
 
     def set_manual_led(self, state: bool) -> None:
+        self.apply_servo_command(led=bool(state))
+
+    def set_manual_laser(self, state: bool) -> None:
+        self.apply_servo_command(laser=bool(state))
+
+    def set_resolution(self, res_code: int) -> None:
+        self.apply_servo_command(res=int(res_code))
+
+    def send_discord_test(self) -> Tuple[bool, str]:
+        frame, _, _ = self.reader.get_latest_frame()
         with self._lock:
-            self._led_on = bool(state)
-        self.hardware.set_led(bool(state))
+            servo_x = int(round(self._curr_x))
+            servo_y = int(round(self._curr_y))
+            led_on = self._led_on
+            laser_on = self._laser_on
+        return self.discord.send_test(
+            frame=frame,
+            servo_x=servo_x,
+            servo_y=servo_y,
+            led_on=led_on,
+            laser_on=laser_on,
+        )
 
     def get_status(self) -> Dict[str, object]:
+        hw = self.hardware.get_state()
+        discord_status = self.discord.get_status()
+        rotation = self.reader.get_rotation()
+        stream_connected = self.reader.is_connected()
         with self._lock:
+            now = time.time()
+            cv_enabled = (self.auto_aim or self.detect_in_manual) and (self.detect_person or self.detect_dog)
+            eco_idle_s = max(0.0, now - self._last_cv_activity_time) if cv_enabled else 0.0
+            eco_motion_woken = cv_enabled and self.eco_mode and (now < self._eco_wake_until)
             return {
                 "auto_aim": self.auto_aim,
                 "detect_person": self.detect_person,
                 "detect_dog": self.detect_dog,
+                "detect_in_manual": self.detect_in_manual,
+                "eco_mode": self.eco_mode,
+                "eco_delay_s": round(self.eco_delay_s, 1),
+                "eco_fps": round(self.eco_fps, 2),
+                "eco_active": self._eco_active,
+                "eco_idle_s": round(eco_idle_s, 1),
+                "eco_motion_wake": self.eco_motion_wake,
+                "eco_motion_flash": self.eco_motion_flash,
+                "eco_flash_dark_only": self.eco_flash_dark_only,
+                "eco_motion_sensitivity": round(self.eco_motion_sensitivity, 0),
+                "eco_flash_duration_s": round(self.eco_flash_duration_s, 1),
+                "eco_dark_threshold": round(self.eco_dark_threshold, 0),
+                "eco_motion_woken": eco_motion_woken,
+                "eco_flash_active": self._eco_flash_active,
+                "motion_score": round(self._motion_score, 2),
+                "ambient_luma": round(self._ambient_luma, 1),
                 "auto_fire": self.auto_fire,
+                "auto_fire_laser": self.auto_fire_laser,
+                "auto_fire_led": self.auto_fire_led,
                 "aim_mode": self.aim_mode,
                 "led_mode": self.led_mode,
+                "fire_mode": self.led_mode,
                 "kp": round(self.kp, 3),
                 "kd": round(self.kd, 3),
                 "deadzone_px": round(self.deadzone_px, 1),
                 "conf_threshold": round(self.conf_threshold, 2),
                 "invert_x": self.invert_x,
                 "invert_y": self.invert_y,
-                "rotation": self.reader.get_rotation(),
+                "rotation": rotation,
+                "resolution": self.resolution,
+                "frame_size": list(self._frame_size),
                 "person_detected": self._person_detected,
                 "target_type": self._target_type,
                 "detections_count": self._detections_count,
                 "led_on": self._led_on,
+                "laser_on": self._laser_on,
+                "manual_led": self._manual_led,
+                "manual_laser": self._manual_laser,
                 "servo_x": int(round(self._curr_x)),
                 "servo_y": int(round(self._curr_y)),
                 "target_box": self._target_box,
                 "target_center": self._target_center,
                 "error_px": self._error_px,
-                "fps": round(self._fps, 1),
+                "fps": round(self._cv_fps if cv_enabled else self._video_fps, 1),
+                "cv_fps": round(self._cv_fps, 1),
+                "video_fps": round(self._video_fps, 1),
                 "inference_ms": round(self._inference_ms, 1),
                 "device": self.detector.device_info,
-                "stream_connected": self.reader.is_connected(),
+                "stream_connected": stream_connected,
+                "turret_url": self.hardware.base_url,
+                "hw_rtt_ms": hw["last_rtt_ms"],
+                "hw_error": hw["last_error"],
+                "hw_last_url": hw["last_url"],
+                **discord_status,
             }
 
     def get_annotated_jpeg(self) -> Tuple[Optional[bytes], int]:
-        with self._lock:
+        with self._frame_cond:
+            return self._annotated_jpeg, self._annotated_id
+
+    def wait_for_annotated_jpeg(self, last_id: int, timeout: float = 1.0) -> Tuple[Optional[bytes], int]:
+        with self._frame_cond:
+            if (self._annotated_jpeg is None or self._annotated_id == last_id) and not self._stop_event.is_set():
+                self._frame_cond.wait_for(
+                    lambda: self._stop_event.is_set()
+                    or (self._annotated_jpeg is not None and self._annotated_id != last_id),
+                    timeout=timeout,
+                )
             return self._annotated_jpeg, self._annotated_id
 
     def get_annotated_frame(self) -> Tuple[Optional[np.ndarray], int]:
-        with self._lock:
+        with self._frame_cond:
             if self._annotated_frame is None:
                 return None, self._annotated_id
             return self._annotated_frame.copy(), self._annotated_id
+
+    @staticmethod
+    def _compute_motion_diff(
+        prev_gray: Optional[np.ndarray],
+        frame: np.ndarray,
+        sensitivity: float,
+    ) -> Tuple[np.ndarray, bool, float, float]:
+        """Lightweight frame-differencing motion detector (~0.25 ms CPU on 160x120 grayscale).
+
+        Uses Gaussian blur + morphological opening to reject isolated dark-room sensor noise
+        while adapting pixel threshold downward in dim scenes.
+        Returns (curr_gray, motion_triggered, changed_pct, ambient_luma).
+        """
+        small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+        ambient_luma = float(np.mean(gray))
+
+        if prev_gray is None or prev_gray.shape != gray.shape:
+            return gray, False, 0.0, ambient_luma
+
+        diff = cv2.absdiff(prev_gray, gray)
+        s_norm = max(0.0, min(1.0, (sensitivity - 10.0) / 90.0))
+        dark_factor = 0.72 if ambient_luma < 60.0 else 1.0
+        pixel_thresh = max(8, int(round((34.0 - 22.0 * s_norm) * dark_factor)))
+        area_thresh_pct = 3.6 - 3.2 * s_norm
+
+        _, mask = cv2.threshold(diff, pixel_thresh, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        changed_pixels = int(cv2.countNonZero(mask))
+        total_pixels = max(1, int(gray.size))
+        changed_pct = (changed_pixels * 100.0) / float(total_pixels)
+        return gray, (changed_pct >= area_thresh_pct), changed_pct, ambient_luma
 
     @staticmethod
     def _compute_dynamic_step(
@@ -867,26 +1882,39 @@ class AutoAimEngine:
 
     def _loop(self) -> None:
         last_frame_id = -1
-        fps_ema = 0.0
+        video_fps_ema = 0.0
+        cv_fps_ema = 0.0
         prev_loop_time = time.time()
+        last_cv_exec_time = 0.0
+        last_motion_check_time = 0.0
+        last_inference_ms = 0.0
+        was_eco_active = False
+        woke_from_eco = False
+        prev_led_state = False
 
         while not self._stop_event.is_set():
             frame, frame_id, frame_ts = self.reader.get_latest_frame()
             if frame is None or frame_id == last_frame_id:
-                time.sleep(0.01)
+                time.sleep(0.008)
                 continue
             last_frame_id = frame_id
 
             now = time.time()
             dt_loop = max(1e-3, now - prev_loop_time)
             prev_loop_time = now
-            inst_fps = 1.0 / dt_loop
-            fps_ema = inst_fps if fps_ema == 0.0 else (0.85 * fps_ema + 0.15 * inst_fps)
+            inst_video_fps = 1.0 / dt_loop
+            video_alpha = 1.0 - math.exp(-dt_loop / 0.8)
+            video_fps_ema = (
+                inst_video_fps
+                if video_fps_ema == 0.0
+                else ((1.0 - video_alpha) * video_fps_ema + video_alpha * inst_video_fps)
+            )
 
             with self._lock:
                 auto_aim = self.auto_aim
                 detect_person = self.detect_person
                 detect_dog = self.detect_dog
+                detect_in_manual = self.detect_in_manual
                 auto_fire = self.auto_fire
                 aim_mode = self.aim_mode
                 led_mode = self.led_mode
@@ -896,19 +1924,96 @@ class AutoAimEngine:
                 invert_x = self.invert_x
                 invert_y = self.invert_y
                 prev_smooth = self._smoothed_target
-
-            t_inf_start = time.time()
-            detections = self.detector.detect(
-                frame,
-                conf_threshold=conf_threshold,
-                detect_person=detect_person,
-                detect_dog=detect_dog,
-            )
-            inference_ms = (time.time() - t_inf_start) * 1000.0
+                eco_mode = self.eco_mode
+                eco_delay_s = self.eco_delay_s
+                eco_fps = self.eco_fps
+                eco_motion_wake = self.eco_motion_wake
+                eco_motion_sens = self.eco_motion_sensitivity
+                eco_wake_until = self._eco_wake_until
+                motion_suppress_until = self._motion_suppress_until
+                prev_gray_snap = self._motion_prev_gray
+                last_cv_activity = self._last_cv_activity_time
 
             h, w = frame.shape[:2]
             cx, cy = w * 0.5, h * 0.5
-            target = self.detector.select_target(detections, (h, w), prev_smooth)
+
+            run_cv = (auto_aim or detect_in_manual) and (detect_person or detect_dog)
+            idle_elapsed = max(0.0, now - last_cv_activity) if run_cv else 0.0
+            eco_idle_due = run_cv and eco_mode and (idle_elapsed >= eco_delay_s)
+            eco_woken_now = run_cv and eco_mode and (now < eco_wake_until)
+
+            # Lightweight motion + ambient brightness sampling (up to 5 Hz in Eco, 2 Hz otherwise)
+            motion_interval = 0.20 if eco_idle_due else 0.50
+            sampled_motion = False
+            motion_triggered = False
+            motion_pct = 0.0
+            ambient_luma_sample: Optional[float] = None
+            new_gray: Optional[np.ndarray] = None
+            if (now - last_motion_check_time) >= motion_interval:
+                last_motion_check_time = now
+                sampled_motion = True
+                if eco_idle_due and eco_motion_wake and (now >= motion_suppress_until):
+                    new_gray, motion_triggered, motion_pct, ambient_luma_sample = self._compute_motion_diff(
+                        prev_gray_snap, frame, eco_motion_sens
+                    )
+                else:
+                    small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA)
+                    gray_only = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                    ambient_luma_sample = float(np.mean(gray_only))
+
+            if run_cv:
+                eco_active = eco_idle_due and not eco_woken_now
+                if eco_active:
+                    eco_period = 1.0 / max(0.2, eco_fps)
+                    should_run_detector = (last_cv_exec_time == 0.0) or ((now - last_cv_exec_time) >= eco_period)
+                    if not was_eco_active:
+                        cv_fps_ema = eco_fps
+                        woke_from_eco = False
+                else:
+                    should_run_detector = True
+                    if was_eco_active:
+                        woke_from_eco = True
+                was_eco_active = eco_active
+            else:
+                eco_active = False
+                should_run_detector = False
+                was_eco_active = False
+                woke_from_eco = False
+                cv_fps_ema = 0.0
+                last_cv_exec_time = 0.0
+
+            if should_run_detector:
+                t_inf_start = time.time()
+                detections = self.detector.detect(
+                    frame,
+                    conf_threshold=conf_threshold,
+                    detect_person=detect_person,
+                    detect_dog=detect_dog,
+                    force_fallback=eco_active,
+                )
+                inference_ms = (time.time() - t_inf_start) * 1000.0
+                last_inference_ms = inference_ms
+                if last_cv_exec_time > 0.0:
+                    dt_cv = max(1e-3, now - last_cv_exec_time)
+                    inst_cv_fps = 1.0 / dt_cv
+                    if woke_from_eco:
+                        cv_fps_ema = inst_cv_fps
+                        woke_from_eco = False
+                    else:
+                        cv_alpha = 1.0 - math.exp(-dt_cv / 1.0)
+                        cv_fps_ema = (
+                            inst_cv_fps
+                            if cv_fps_ema == 0.0
+                            else ((1.0 - cv_alpha) * cv_fps_ema + cv_alpha * inst_cv_fps)
+                        )
+                else:
+                    cv_fps_ema = inst_video_fps
+                last_cv_exec_time = now
+                target = self.detector.select_target(detections, (h, w), prev_smooth)
+            else:
+                detections = []
+                inference_ms = last_inference_ms if run_cv else 0.0
+                target = None
 
             target_detected = target is not None
             err_x = 0.0
@@ -916,16 +2021,50 @@ class AutoAimEngine:
             aim_pt: Optional[Tuple[float, float]] = None
 
             with self._lock:
+                self._frame_size = [w, h]
+                if not self._res_explicit:
+                    self.resolution = infer_resolution_code(w, h)
+
+                if sampled_motion:
+                    if ambient_luma_sample is not None:
+                        self._ambient_luma = ambient_luma_sample
+                    if new_gray is not None and now >= self._motion_suppress_until:
+                        self._motion_prev_gray = new_gray
+                        self._motion_score = motion_pct
+                    else:
+                        self._motion_prev_gray = None
+                        self._motion_score = 0.0
+
+                # Re-check self.auto_aim under lock in case manual mode was activated during inference
+                active_auto_aim = self.auto_aim
+                active_run_cv = (active_auto_aim or self.detect_in_manual) and (
+                    self.detect_person or self.detect_dog
+                )
+                should_sync_hw = False
+
+                if not active_run_cv:
+                    self._last_cv_activity_time = now
+                    self._eco_wake_until = 0.0
+                    if self._eco_flash_active:
+                        self._eco_flash_active = False
+                        self._eco_flash_until = 0.0
+                        should_sync_hw = True
+
                 if target is not None:
                     tx, ty = self.detector.compute_aim_point(target, aim_mode=aim_mode)
                     self._smoothed_target = (tx, ty)
                     self._last_detection_time = now
+                    self._last_cv_activity_time = now
+                    self._eco_wake_until = 0.0
+                    if self._eco_flash_active:
+                        # Keep light on while actively tracking a target illuminated by Eco motion flash
+                        self._eco_flash_until = max(self._eco_flash_until, now + 2.5)
                     aim_pt = (tx, ty)
 
                     err_x = tx - cx
                     err_y = ty - cy
 
-                    if auto_aim:
+                    if active_auto_aim:
                         if (now - self._last_servo_step_time) >= self.min_servo_interval:
                             px_per_deg_x = 10.3 * (w / 600.0)
                             px_per_deg_y = 9.2 * (h / 800.0)
@@ -954,11 +2093,11 @@ class AutoAimEngine:
                                 self._curr_x = max(5.0, min(175.0, self._curr_x + step_x))
                                 self._curr_y = max(15.0, min(165.0, self._curr_y + step_y))
                                 self._last_servo_step_time = now
-                                self.hardware.set_angles(self._curr_x, self._curr_y)
+                                should_sync_hw = True
 
+                        prev_fire = self._auto_fire_active
                         if not auto_fire or led_mode == "off":
-                            self._led_on = False
-                            self.hardware.set_led(False)
+                            self._auto_fire_active = False
                         elif led_mode == "on_lock":
                             box_w = target.x2 - target.x1
                             box_h = target.y2 - target.y1
@@ -967,28 +2106,100 @@ class AutoAimEngine:
                                 and (target.y1 - deadzone_px <= cy <= target.y2 + deadzone_px)
                             )
                             lock_radius = max(deadzone_px * 2.2, min(box_w, box_h) * 0.45)
-                            on_target = in_box or (math.hypot(err_x, err_y) <= lock_radius)
-                            self._led_on = on_target
-                            self.hardware.set_led(on_target)
+                            self._auto_fire_active = in_box or (math.hypot(err_x, err_y) <= lock_radius)
                         else:
-                            self._led_on = True
-                            self.hardware.set_led(True)
+                            self._auto_fire_active = True
+
+                        if self._auto_fire_active != prev_fire:
+                            should_sync_hw = True
                 else:
+                    prev_fire = self._auto_fire_active
                     if (now - self._last_detection_time) > self.hold_timeout:
                         self._smoothed_target = None
                         self._prev_deg_err_x = 0.0
                         self._prev_deg_err_y = 0.0
-                        if auto_aim:
-                            self._led_on = False
-                            self.hardware.set_led(False)
-                    elif auto_aim and (not auto_fire or led_mode == "off"):
-                        self._led_on = False
-                        self.hardware.set_led(False)
+                        if active_auto_aim:
+                            self._auto_fire_active = False
+                    elif active_auto_aim and (not auto_fire or led_mode == "off"):
+                        self._auto_fire_active = False
+                    if self._auto_fire_active != prev_fire:
+                        should_sync_hw = True
+
+                    if self._eco_flash_active and (
+                        not active_run_cv
+                        or not self.eco_mode
+                        or not self.eco_motion_wake
+                        or not self.eco_motion_flash
+                        or now >= self._eco_flash_until
+                    ):
+                        self._eco_flash_active = False
+                        self._eco_flash_until = 0.0
+                        self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+                        self._motion_prev_gray = None
+                        should_sync_hw = True
+
+                prev_eco_locked = self._eco_active
+                eco_idle_locked = (
+                    active_run_cv
+                    and self.eco_mode
+                    and ((now - self._last_cv_activity_time) >= self.eco_delay_s)
+                )
+
+                if (
+                    prev_eco_locked
+                    and eco_idle_locked
+                    and self.eco_motion_wake
+                    and motion_triggered
+                    and (now >= self._motion_suppress_until)
+                    and (now >= self._eco_wake_until)
+                ):
+                    self._eco_wake_until = now + self.eco_flash_duration_s
+                    luma_val = ambient_luma_sample if ambient_luma_sample is not None else self._ambient_luma
+                    should_light = self.eco_motion_flash and (
+                        (not self.eco_flash_dark_only) or (luma_val < self.eco_dark_threshold)
+                    )
+                    if should_light:
+                        self._eco_flash_until = now + self.eco_flash_duration_s
+                        if not self._eco_flash_active:
+                            self._eco_flash_active = True
+                            self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+                            self._motion_prev_gray = None
+                            should_sync_hw = True
+
+                eco_woken_locked = active_run_cv and self.eco_mode and (now < self._eco_wake_until)
+                eco_active_now = eco_idle_locked and not eco_woken_locked
+                if was_eco_active and not eco_active_now:
+                    woke_from_eco = True
+                    was_eco_active = False
+                self._eco_active = eco_active_now
+
+                if eco_active_now and not prev_eco_locked:
+                    if active_auto_aim:
+                        if int(round(self._curr_x)) != 90 or int(round(self._curr_y)) != 90:
+                            self._curr_x = 90.0
+                            self._curr_y = 90.0
+                            self._prev_deg_err_x = 0.0
+                            self._prev_deg_err_y = 0.0
+                            self._smoothed_target = None
+                            self._wait_frame_after = now + 0.12
+                            should_sync_hw = True
+                        else:
+                            self._curr_x = 90.0
+                            self._curr_y = 90.0
+                    self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+                    self._motion_prev_gray = None
+
+                if should_sync_hw:
+                    self._sync_hardware_locked()
+                    if self._led_on != prev_led_state:
+                        self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+                        self._motion_prev_gray = None
 
                 curr_x_deg = int(round(self._curr_x))
                 curr_y_deg = int(round(self._curr_y))
                 led_state = self._led_on
-                fire_enabled = auto_fire and led_mode != "off"
+                laser_state = self._laser_on
+                prev_led_state = led_state
 
                 self._person_detected = target_detected
                 self._target_type = target.source if target else None
@@ -998,8 +2209,27 @@ class AutoAimEngine:
                 )
                 self._target_center = [int(round(aim_pt[0])), int(round(aim_pt[1]))] if aim_pt else None
                 self._error_px = [int(round(err_x)), int(round(err_y))]
-                self._fps = fps_ema
+                self._video_fps = video_fps_ema
+                self._cv_fps = cv_fps_ema if active_run_cv else 0.0
+                self._fps = self._cv_fps if active_run_cv else video_fps_ema
                 self._inference_ms = inference_ms
+                display_fps = self._fps
+
+            face_det = (
+                self.detector.detect_face_in_crop(frame, target)
+                if (target is not None and self.discord.needs_face_check(target, now))
+                else None
+            )
+            self.discord.observe(
+                frame=frame,
+                target=target,
+                face_det=face_det,
+                servo_x=curr_x_deg,
+                servo_y=curr_y_deg,
+                led_on=led_state,
+                laser_on=laser_state,
+                now=now,
+            )
 
             annotated = self._draw_overlay(
                 frame=frame,
@@ -1007,29 +2237,45 @@ class AutoAimEngine:
                 target=target,
                 aim_pt=aim_pt,
                 deadzone_px=deadzone_px,
-                auto_aim=auto_aim,
-                fire_enabled=fire_enabled,
+                auto_aim=active_auto_aim,
                 led_on=led_state,
+                laser_on=laser_state,
                 servo_x=curr_x_deg,
                 servo_y=curr_y_deg,
                 err_x=err_x,
                 err_y=err_y,
-                fps=fps_ema,
+                fps=display_fps,
+                eco_active=eco_active_now,
+                eco_motion_woken=eco_woken_locked,
             )
 
             ok, encoded = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
             if ok:
                 jpg_bytes = encoded.tobytes()
-                with self._lock:
+                with self._frame_cond:
                     self._annotated_frame = annotated
                     self._annotated_jpeg = jpg_bytes
                     self._annotated_id += 1
+                    self._frame_cond.notify_all()
 
-            if DEFAULT_MAX_FPS > 0:
+            if not run_cv:
+                target_fps = max(DEFAULT_MAX_FPS, 45.0)
+            elif eco_active_now:
+                target_fps = max(eco_fps, min(DEFAULT_MAX_FPS, 8.0))
+            else:
+                target_fps = DEFAULT_MAX_FPS
+
+            if target_fps > 0:
                 dt_compute = time.time() - now
-                min_period = 1.0 / DEFAULT_MAX_FPS
-                if dt_compute < min_period:
-                    time.sleep(min_period - dt_compute)
+                min_period = 1.0 / target_fps
+                sleep_s = min_period - dt_compute
+                if eco_active_now and last_cv_exec_time > 0.0:
+                    eco_period = 1.0 / max(0.2, eco_fps)
+                    until_next_cv = eco_period - (time.time() - last_cv_exec_time)
+                    if until_next_cv > 0.0:
+                        sleep_s = min(sleep_s, until_next_cv)
+                if sleep_s > 0.0:
+                    time.sleep(sleep_s)
 
     @staticmethod
     def _draw_overlay(
@@ -1039,28 +2285,41 @@ class AutoAimEngine:
         aim_pt: Optional[Tuple[float, float]],
         deadzone_px: float,
         auto_aim: bool,
-        fire_enabled: bool,
         led_on: bool,
+        laser_on: bool,
         servo_x: int,
         servo_y: int,
         err_x: float,
         err_y: float,
         fps: float,
+        eco_active: bool = False,
+        eco_motion_woken: bool = False,
     ) -> np.ndarray:
         vis = frame.copy()
         h, w = vis.shape[:2]
         cx, cy = int(round(w * 0.5)), int(round(h * 0.5))
+        firing = laser_on or led_on
 
         # Center reticle & deadzone ring
-        reticle_color = (0, 220, 255) if target is not None else (200, 200, 200)
-        cv2.line(vis, (cx - 22, cy), (cx + 22, cy), reticle_color, 1, cv2.LINE_AA)
-        cv2.line(vis, (cx, cy - 22), (cx, cy + 22), reticle_color, 1, cv2.LINE_AA)
-        cv2.circle(vis, (cx, cy), max(4, int(round(deadzone_px))), reticle_color, 1, cv2.LINE_AA)
+        if laser_on:
+            reticle_color = (94, 235, 65)
+        elif target is not None:
+            reticle_color = (0, 220, 255)
+        else:
+            reticle_color = (185, 195, 210)
+
+        cv2.line(vis, (cx - 20, cy), (cx - 6, cy), reticle_color, 1, cv2.LINE_AA)
+        cv2.line(vis, (cx + 6, cy), (cx + 20, cy), reticle_color, 1, cv2.LINE_AA)
+        cv2.line(vis, (cx, cy - 20), (cx, cy - 6), reticle_color, 1, cv2.LINE_AA)
+        cv2.line(vis, (cx, cy + 6), (cx, cy + 20), reticle_color, 1, cv2.LINE_AA)
+        cv2.circle(vis, (cx, cy), 2, reticle_color, -1, cv2.LINE_AA)
+        if auto_aim:
+            cv2.circle(vis, (cx, cy), max(4, int(round(deadzone_px))), reticle_color, 1, cv2.LINE_AA)
 
         # Draw detections
         for det in detections:
             is_active = target is not None and det is target
-            color = (0, 0, 255) if (is_active and led_on) else ((0, 230, 80) if is_active else (0, 215, 255))
+            color = (0, 0, 255) if (is_active and firing) else ((60, 235, 110) if is_active else (0, 215, 255))
             thickness = 2 if is_active else 1
             x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
@@ -1072,7 +2331,7 @@ class AutoAimEngine:
                 label,
                 (x1, max(20, y1 - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.52,
                 color,
                 2,
                 cv2.LINE_AA,
@@ -1081,33 +2340,41 @@ class AutoAimEngine:
         # Aim vector & lock dot
         if aim_pt is not None:
             tx, ty = int(round(aim_pt[0])), int(round(aim_pt[1]))
-            dot_color = (0, 0, 255) if led_on else (0, 255, 0)
-            cv2.line(vis, (cx, cy), (tx, ty), (255, 180, 0), 2, cv2.LINE_AA)
-            cv2.circle(vis, (tx, ty), 6, dot_color, -1, cv2.LINE_AA)
-            cv2.circle(vis, (tx, ty), 10, (255, 255, 255), 1, cv2.LINE_AA)
+            dot_color = (0, 0, 255) if firing else (60, 240, 110)
+            cv2.line(vis, (cx, cy), (tx, ty), (255, 190, 40), 2, cv2.LINE_AA)
+            cv2.circle(vis, (tx, ty), 5, dot_color, -1, cv2.LINE_AA)
+            cv2.circle(vis, (tx, ty), 9, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Top translucent HUD bar
+        # Top compact translucent HUD bar
         overlay = vis.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 56), (18, 18, 22), -1)
+        cv2.rectangle(overlay, (0, 0), (w, 48), (12, 16, 22), -1)
         cv2.addWeighted(overlay, 0.72, vis, 0.28, 0, vis)
 
         mode_str = "AUTO-AIM" if auto_aim else "MANUAL"
+        laser_str = "LASER:ON" if laser_on else "LASER:OFF"
+        flash_str = "FLASH:ON" if led_on else "FLASH:OFF"
         if target is not None:
             tgt_label = SOURCE_LABELS.get(target.source, "ALVO")
-            tgt_str = f"ALVO: {tgt_label}"
+            tgt_str = f"ALVO:{tgt_label}"
+        elif eco_motion_woken:
+            tgt_str = "MOVIMENTO"
         else:
-            tgt_str = "ALVO: BUSCANDO"
+            tgt_str = "LIVRE" if not auto_aim else ("ECO" if eco_active else "BUSCANDO")
 
-        if not fire_enabled:
-            led_str = "TIRO: DESATIVADO"
+        eco_tag = " [ECO]" if eco_active else (" [MOV]" if eco_motion_woken else "")
+        line1 = f"{mode_str} | {tgt_str} | {laser_str} | {flash_str}"
+        line2 = f"X:{servo_x}deg Y:{servo_y}deg | ERR:({int(round(err_x)):+d},{int(round(err_y)):+d})px | {fps:.1f}FPS{eco_tag}"
+
+        if laser_on:
+            status_color = (94, 235, 65)
+        elif led_on:
+            status_color = (40, 200, 255)
+        elif eco_active:
+            status_color = (94, 234, 212)
         else:
-            led_str = "LED: ACESO (ATIRANDO)" if led_on else "LED: DESLIGADO"
+            status_color = (225, 232, 240)
 
-        line1 = f"MODO: {mode_str}  |  {tgt_str}  |  {led_str}"
-        line2 = f"X: {servo_x} deg  Y: {servo_y} deg  |  ERRO: ({int(round(err_x)):+d}, {int(round(err_y)):+d}) px  |  FPS: {fps:.1f}"
-
-        led_color = (0, 220, 255) if led_on else ((160, 160, 175) if not fire_enabled else (210, 210, 220))
-        cv2.putText(vis, line1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, led_color, 1, cv2.LINE_AA)
-        cv2.putText(vis, line2, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 235, 240), 1, cv2.LINE_AA)
+        cv2.putText(vis, line1, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1, cv2.LINE_AA)
+        cv2.putText(vis, line2, (10, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (190, 200, 215), 1, cv2.LINE_AA)
 
         return vis

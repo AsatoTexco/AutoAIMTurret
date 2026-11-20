@@ -26,6 +26,8 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY app.py turret_controller.py run.sh README.md ./
+COPY templates ./templates
+COPY static ./static
 COPY models ./models
 
 EXPOSE 5000
