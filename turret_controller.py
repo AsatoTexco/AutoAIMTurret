@@ -96,6 +96,8 @@ RESOLUTION_OPTIONS = {
     1: ("CIF", 400, 296),
     2: ("VGA", 640, 480),
     3: ("SVGA", 800, 600),
+    4: ("WIDE", 320, 176),
+    5: ("WIDE+", 400, 224),
 }
 
 CAM_GAIN_OPTIONS = {
@@ -107,7 +109,7 @@ CAM_GAIN_OPTIONS = {
     5: "64x",
 }
 
-DEFAULT_CAM_RES = 1
+DEFAULT_CAM_RES = 5
 DEFAULT_CAM_QUAL = 16
 DEFAULT_CAM_BRI = 1
 DEFAULT_CAM_AE = 1
@@ -117,9 +119,13 @@ DEFAULT_CAM_NIGHT = False
 
 def infer_resolution_code(width: int, height: int) -> int:
     long_edge = max(width, height)
-    best_code = DEFAULT_CAM_RES
+    short_edge = max(1, min(width, height))
+    if (long_edge / float(short_edge)) >= 1.55:
+        return 4 if long_edge <= 360 else 5
+    best_code = 1
     best_diff = 10**9
-    for code, (_, rw, _) in RESOLUTION_OPTIONS.items():
+    for code in (0, 1, 2, 3):
+        _, rw, _ = RESOLUTION_OPTIONS[code]
         diff = abs(long_edge - rw)
         if diff < best_diff:
             best_diff = diff
@@ -519,7 +525,7 @@ class TurretHardwareClient:
           Servos apply immediately (no ramp) with 500 ms PWM Auto-Detach on ESP32; sends minimal
           delta queries ("laser=1", "led=0") when servos are parked so Auto-Detach stays undisturbed.
           0 ms immediate priority for laser/led; 35 ms minimum interval (~28.6 Hz) to cut Port 80/81 Wi-Fi contention.
-        * GET /cam -> camera settings (res=0..3, qual=10..40, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
+        * GET /cam -> camera settings (res=0..5, qual=10..40, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
           dispatched with 0 ms priority without waking servos.
     - Safety fail-safe:
         * Always transmits GET /servo?laser=0&led=0 on shutdown() and supports runtime
@@ -642,7 +648,7 @@ class TurretHardwareClient:
         changed = False
         with self._lock:
             if res is not None:
-                ires = max(0, min(3, int(res)))
+                ires = max(0, min(5, int(res)))
                 if force or ires != self._target_cam_res or ires != self._sent_cam_res:
                     self._target_cam_res = ires
                     if force:
@@ -2102,7 +2108,7 @@ class AutoAimEngine:
         self.conf_threshold: float = 0.28
         self.invert_x: bool = False
         self.invert_y: bool = False
-        self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF (default ~25-28 FPS), 2=VGA, 3=SVGA
+        self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=WIDE (320x176), 5=WIDE+ (400x224)
         self.cam_qual: int = DEFAULT_CAM_QUAL  # 10..40 (lower = sharper; 16 = balanced)
         self.cam_bri: int = DEFAULT_CAM_BRI  # -3..3
         self.cam_ae: int = DEFAULT_CAM_AE  # -5..5
@@ -2491,7 +2497,7 @@ class AutoAimEngine:
                     self._motion_prev_gray = None
                     self._motion_suppress_until = max(self._motion_suppress_until, now + 1.0)
             if "resolution" in cfg and cfg["resolution"] is not None:
-                res_code = max(0, min(3, int(cfg["resolution"])))
+                res_code = max(0, min(5, int(cfg["resolution"])))
                 if res_code != self.resolution or not self._res_explicit:
                     self.resolution = res_code
                     self._res_explicit = True
@@ -2614,7 +2620,7 @@ class AutoAimEngine:
             any_set = False
 
             if res is not None:
-                res_code = max(0, min(3, int(res)))
+                res_code = max(0, min(5, int(res)))
                 self.resolution = res_code
                 self._res_explicit = True
                 any_set = True

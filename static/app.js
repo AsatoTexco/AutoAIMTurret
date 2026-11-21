@@ -8,6 +8,8 @@ const RES_NAMES = {
   1: 'CIF (400×296)',
   2: 'VGA (640×480)',
   3: 'SVGA (800×600)',
+  4: 'WIDE (320×176 · 16:9)',
+  5: 'WIDE+ (400×224 · 16:9)',
 };
 const CAM_GAIN_NAMES = {
   0: '2x',
@@ -248,7 +250,7 @@ const state = {
   autoAim: true,
   aimMode: 'center',
   rotation: 90,
-  resolution: 1,
+  resolution: 5,
   camQual: 16,
   camBri: 1,
   camAe: 1,
@@ -1271,7 +1273,7 @@ function setRotation(rot) {
 async function sendCamCommand(patch = {}) {
   const params = new URLSearchParams();
   if (patch.res !== undefined && patch.res !== null) {
-    params.set('res', String(Math.max(0, Math.min(3, parseInt(patch.res, 10)))));
+    params.set('res', String(Math.max(0, Math.min(5, parseInt(patch.res, 10)))));
   }
   if (patch.qual !== undefined && patch.qual !== null) {
     params.set('qual', String(Math.max(10, Math.min(40, parseInt(patch.qual, 10)))));
@@ -1304,7 +1306,7 @@ async function sendCamCommand(patch = {}) {
 }
 
 function selectResolution(code) {
-  const clamped = Math.max(0, Math.min(3, parseInt(code, 10)));
+  const clamped = Math.max(0, Math.min(5, parseInt(code, 10)));
   state.resolution = clamped;
   renderResolutionGrid(clamped);
   sendCamCommand({ res: clamped });
@@ -1876,7 +1878,7 @@ function applyStatus(s) {
       state.autoAim = Boolean(s.auto_aim);
       state.aimMode = s.aim_mode || 'center';
       state.rotation = s.rotation ?? 90;
-      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 1));
+      state.resolution = Math.max(0, Math.min(5, s.resolution ?? 5));
       state.camQual = typeof s.cam_qual === 'number' ? s.cam_qual : 16;
       state.camBri = typeof s.cam_bri === 'number' ? s.cam_bri : 1;
       state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 1;
@@ -1965,7 +1967,7 @@ function applyStatus(s) {
       state.manualY = s.servo_y;
       if (performance.now() - state.lastCamSentAt > 1200) {
         if (typeof s.resolution === 'number') {
-          state.resolution = Math.max(0, Math.min(3, s.resolution));
+          state.resolution = Math.max(0, Math.min(5, s.resolution));
           renderResolutionGrid(state.resolution);
         }
         let camLabelDirty = false;

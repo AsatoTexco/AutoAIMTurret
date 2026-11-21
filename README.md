@@ -25,7 +25,7 @@ Configurações da câmera são enviadas separadamente sem interferir nos servos
 
 | Parâmetro | Intervalo | Padrão | Descrição |
 | :--- | :--- | :--- | :--- |
-| `res` | `0..3` | `1` | Resolução (`0=QVGA 320×240`, `1=CIF 400×296` padrão rápido ~25–28 FPS, `2=VGA 640×480`, `3=SVGA 800×600`) |
+| `res` | `0..5` | `5` | Resolução (`0=QVGA 320×240`, `1=CIF 400×296`, `2=VGA 640×480`, `3=SVGA 800×600`, `4=WIDE 320×176` e `5=WIDE+ 400×224` 16:9 horizontal em 90°) |
 | `qual` | `10..40` | `16` | Qualidade JPEG (menor = mais nítido; `16` equilibra nitidez e banda) |
 | `bri` | `-3..3` | `1` | Brilho |
 | `ae` | `-5..5` | `1` | Nível de exposição automática |
@@ -33,7 +33,7 @@ Configurações da câmera são enviadas separadamente sem interferir nos servos
 | `night` | `0` ou `1` | `0` | Modo Noturno (`aec2`; `0` mantém FPS máximo em ambiente interno) |
 
 ```text
-GET http://<IP_DO_ESP32>/cam?res=1&qual=16&bri=1&ae=1&gain=4&night=0
+GET http://<IP_DO_ESP32>/cam?res=5&qual=16&bri=1&ae=1&gain=4&night=0
 ```
 
 **Regras de despacho Single-Flight & Fail-Safe:**

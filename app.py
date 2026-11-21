@@ -111,7 +111,7 @@ def cam_control():
     """Camera settings route mirroring ESP32-CAM GET /cam on port 80 (OV3660).
 
     Accepted optional & combinable query parameters (<= 95 chars):
-      res=0..3     -> Resolution (0=QVGA, 1=CIF default ~25-28 FPS, 2=VGA, 3=SVGA)
+      res=0..5     -> Resolution (0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=WIDE 320x176, 5=WIDE+ 400x224 default)
       qual=10..40  -> JPEG quality (lower = sharper, default 16)
       bri=-3..3    -> Brightness (default 1)
       ae=-5..5     -> Auto-exposure level (default 1)
