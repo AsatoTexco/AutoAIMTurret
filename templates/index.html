@@ -346,8 +346,8 @@
                   <label class="drawer-label">Resolução da Câmera</label>
                   <div class="res-grid compact-res" id="gameResGrid">
                     <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)"><strong>QVGA</strong><span>320×240</span></button>
-                    <button type="button" class="res-btn active" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
-                    <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×600</span></button>
+                    <button type="button" class="res-btn active" data-res="1" onclick="selectResolution(1)"><strong>CIF</strong><span>400×296</span></button>
+                    <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
                   </div>
                 </div>
               </div>
@@ -902,17 +902,17 @@
               <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)">
                 <strong>QVGA</strong><span>320×240</span>
               </button>
-              <button type="button" class="res-btn" data-res="1" onclick="selectResolution(1)">
-                <strong>CIF</strong><span>400×296</span>
+              <button type="button" class="res-btn active" data-res="1" onclick="selectResolution(1)">
+                <strong>CIF</strong><span>400×296 (Rápido)</span>
               </button>
-              <button type="button" class="res-btn active" data-res="2" onclick="selectResolution(2)">
-                <strong>VGA</strong><span>640×480 (30 FPS)</span>
+              <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)">
+                <strong>VGA</strong><span>640×480</span>
               </button>
               <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)">
                 <strong>SVGA</strong><span>800×600 (Máx)</span>
               </button>
             </div>
-            <p class="card-hint">VGA (640×480) é o padrão recomendado: encaixe 1:1 no YOLOv8n (640) com 30 FPS estáveis. Alterações são enviadas via GET /cam?res=0..3.</p>
+            <p class="card-hint">CIF (400×296) é o padrão recomendado para Wi-Fi 2.4 GHz: ~6,5 KB/frame com 24–28 FPS estáveis e resposta imediata nos servos. Alterações são enviadas via GET /cam?res=0..3.</p>
           </div>
 
           <div class="panel-card">
@@ -924,9 +924,9 @@
             <div class="slider-field">
               <div class="field-top">
                 <label for="camQual">Qualidade JPEG (qual · menor = mais nítido)</label>
-                <span class="mono-val" id="camQualVal">18</span>
+                <span class="mono-val" id="camQualVal">16</span>
               </div>
-              <input type="range" id="camQual" min="10" max="40" step="1" value="18" oninput="updateLabels()" onchange="onCamQualChange()">
+              <input type="range" id="camQual" min="10" max="40" step="1" value="16" oninput="updateLabels()" onchange="onCamQualChange()">
             </div>
 
             <div class="slider-field">
@@ -961,18 +961,10 @@
               </div>
             </div>
 
-            <div class="slider-field">
-              <div class="field-top">
-                <label for="camDn">Redução de Ruído DSP (dn · 0 = OFF)</label>
-                <span class="mono-val" id="camDnVal">4</span>
-              </div>
-              <input type="range" id="camDn" min="0" max="8" step="1" value="4" oninput="updateLabels()" onchange="onCamDnChange()">
-            </div>
-
             <div class="toggle-row">
               <div>
                 <div class="row-title">Modo Noturno (night / aec2)</div>
-                <div class="row-sub">Desligado = mantém 30 FPS fixos; ligado = longa exposição no escuro</div>
+                <div class="row-sub">Desligado = mantém FPS máximo; ligado = longa exposição no escuro</div>
               </div>
               <label class="switch">
                 <input type="checkbox" id="camNight" onchange="onCamNightChange()">
@@ -981,7 +973,7 @@
             </div>
 
             <button type="button" id="btnCamReset" class="cam-reset-btn" onclick="resetCamDefaults()">
-              Restaurar Padrão OV3660 (qual=18 · bri=+1 · ae=+1 · 32x · dn=4 · night=0)
+              Restaurar Padrão OV3660 (qual=16 · bri=+1 · ae=+1 · 32x · night=0)
             </button>
           </div>
 

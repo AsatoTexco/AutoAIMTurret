@@ -248,14 +248,12 @@ const state = {
   autoAim: true,
   aimMode: 'center',
   rotation: 90,
-  resolution: 2,
-  camQual: 18,
+  resolution: 1,
+  camQual: 16,
   camBri: 1,
   camAe: 1,
   camGain: 4,
   camNight: false,
-  camDn: 4,
-  streamTransport: 'connecting',
   lastCamSentAt: 0,
   autoFireLaser: true,
   autoFireLed: false,
@@ -1109,12 +1107,10 @@ function updateLabels() {
   const briEl = document.getElementById('camBri');
   const aeEl = document.getElementById('camAe');
   const gainEl = document.getElementById('camGain');
-  const dnEl = document.getElementById('camDn');
   const qualVal = qualEl ? parseInt(qualEl.value, 10) : state.camQual;
   const briVal = briEl ? parseInt(briEl.value, 10) : state.camBri;
   const aeVal = aeEl ? parseInt(aeEl.value, 10) : state.camAe;
   const gainVal = gainEl ? parseInt(gainEl.value, 10) : state.camGain;
-  const dnVal = dnEl ? parseInt(dnEl.value, 10) : state.camDn;
   if (qualEl) {
     document.getElementById('camQualVal').textContent = String(qualVal);
   }
@@ -1126,9 +1122,6 @@ function updateLabels() {
   }
   if (gainEl) {
     document.getElementById('camGainVal').textContent = CAM_GAIN_NAMES[gainVal] || `${gainVal}`;
-  }
-  if (dnEl) {
-    document.getElementById('camDnVal').textContent = dnVal === 0 ? 'OFF' : String(dnVal);
   }
   document.querySelectorAll('#camGainPresets .preset-chip').forEach((btn) => {
     btn.classList.toggle('active', parseInt(btn.dataset.gain, 10) === gainVal);
@@ -1295,9 +1288,6 @@ async function sendCamCommand(patch = {}) {
   if (patch.night !== undefined && patch.night !== null) {
     params.set('night', patch.night ? '1' : '0');
   }
-  if (patch.dn !== undefined && patch.dn !== null) {
-    params.set('dn', String(Math.max(0, Math.min(8, parseInt(patch.dn, 10)))));
-  }
   const qs = params.toString();
   if (!qs) return;
 
@@ -1361,35 +1351,25 @@ function onCamNightChange() {
   sendCamCommand({ night: val });
 }
 
-function onCamDnChange() {
-  const val = Math.max(0, Math.min(8, parseInt(document.getElementById('camDn').value, 10)));
-  state.camDn = val;
-  updateLabels();
-  sendCamCommand({ dn: val });
-}
-
 function resetCamDefaults() {
-  state.camQual = 18;
+  state.camQual = 16;
   state.camBri = 1;
   state.camAe = 1;
   state.camGain = 4;
   state.camNight = false;
-  state.camDn = 4;
   const elQual = document.getElementById('camQual');
   const elBri = document.getElementById('camBri');
   const elAe = document.getElementById('camAe');
   const elGain = document.getElementById('camGain');
   const elNight = document.getElementById('camNight');
-  const elDn = document.getElementById('camDn');
-  if (elQual) elQual.value = '18';
+  if (elQual) elQual.value = '16';
   if (elBri) elBri.value = '1';
   if (elAe) elAe.value = '1';
   if (elGain) elGain.value = '4';
   if (elNight) elNight.checked = false;
-  if (elDn) elDn.value = '4';
   updateLabels();
-  sendCamCommand({ qual: 18, bri: 1, ae: 1, gain: 4, night: false, dn: 4 });
-  showToast('Sensor OV3660 restaurado (qual=18, bri=+1, ae=+1, 32x, dn=4, night=0)', 2000);
+  sendCamCommand({ qual: 16, bri: 1, ae: 1, gain: 4, night: false });
+  showToast('Sensor OV3660 restaurado (qual=16, bri=+1, ae=+1, 32x, night=0)', 2000);
 }
 
 function renderSegmented(selector, attr, activeValue) {
@@ -1632,22 +1612,14 @@ function applyStatus(s) {
   if (!s || typeof s !== 'object') return;
 
   // Header Status Pills
-  const transportTag = (s.stream_transport === 'udp' || s.stream_transport === 'http')
-    ? s.stream_transport.toUpperCase()
-    : '';
-  state.streamTransport = s.stream_transport || 'connecting';
   const pStream = document.getElementById('pillStream');
   pStream.className = 'status-pill ' + (s.stream_connected ? 'ok' : 'warn');
-  pStream.querySelector('.pill-text').textContent = s.stream_connected
-    ? (transportTag ? `STREAM ${transportTag}` : 'STREAM ONLINE')
-    : 'RECONECTANDO';
+  pStream.querySelector('.pill-text').textContent = s.stream_connected ? 'STREAM ONLINE' : 'RECONECTANDO';
 
   const gStream = document.getElementById('gameStreamPill');
   if (gStream) {
     gStream.className = 'game-chip ' + (s.stream_connected ? 'ok' : 'warn');
-    document.getElementById('gameStreamText').textContent = s.stream_connected
-      ? (transportTag || 'ONLINE')
-      : 'RECONECT.';
+    document.getElementById('gameStreamText').textContent = s.stream_connected ? 'ONLINE' : 'RECONECT.';
   }
 
   const pDevice = document.getElementById('pillDevice');
@@ -1804,10 +1776,9 @@ function applyStatus(s) {
 
     if (s.frame_size && s.frame_size[0] > 0) {
       const resShort = RES_NAMES[s.resolution]?.split(' ')[0] || '';
-      const protoPrefix = transportTag ? `${transportTag} ` : 'Cam ';
       const streamFpsTag =
         typeof s.stream_fps === 'number' && s.stream_fps > 0
-          ? ` · ${protoPrefix}${s.stream_fps.toFixed(0)} FPS`
+          ? ` · Cam ${s.stream_fps.toFixed(0)} FPS`
           : '';
       const vidFpsInfo = ecoActive && typeof s.video_fps === 'number'
         ? `ECO · Vídeo ${s.video_fps.toFixed(0)} FPS`
@@ -1828,10 +1799,7 @@ function applyStatus(s) {
     const hwInfo = document.getElementById('metaTransportInfo');
     const manualBadge = document.getElementById('manualStatusBadge');
     if (hwInfo) {
-      const vidDesc = transportTag === 'UDP'
-        ? 'Vídeo UDP:82'
-        : (transportTag === 'HTTP' ? 'Vídeo HTTP:81' : 'Vídeo Auto (UDP:82/HTTP:81)');
-      hwInfo.textContent = `${vidDesc} | Controle HTTP keep-alive · ${state.hwMoveIntervalMs} ms · Auto-Detach 500ms`;
+      hwInfo.textContent = `HTTP keep-alive (/servo + /cam) · ${state.hwMoveIntervalMs} ms · Auto-Detach 500ms`;
     }
     if (manualBadge) {
       manualBadge.textContent = `${state.hwMoveIntervalMs} ms HTTP · Single-Flight`;
@@ -1908,13 +1876,12 @@ function applyStatus(s) {
       state.autoAim = Boolean(s.auto_aim);
       state.aimMode = s.aim_mode || 'center';
       state.rotation = s.rotation ?? 90;
-      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 2));
-      state.camQual = typeof s.cam_qual === 'number' ? s.cam_qual : 18;
+      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 1));
+      state.camQual = typeof s.cam_qual === 'number' ? s.cam_qual : 16;
       state.camBri = typeof s.cam_bri === 'number' ? s.cam_bri : 1;
       state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 1;
       state.camGain = typeof s.cam_gain === 'number' ? s.cam_gain : 4;
       state.camNight = s.cam_night !== undefined ? Boolean(s.cam_night) : false;
-      state.camDn = typeof s.cam_dn === 'number' ? s.cam_dn : 4;
       state.autoFireLaser = s.auto_fire_laser !== undefined ? Boolean(s.auto_fire_laser) : true;
       state.autoFireLed = s.auto_fire_led !== undefined ? Boolean(s.auto_fire_led) : false;
       state.invertX = Boolean(s.invert_x);
@@ -1965,13 +1932,11 @@ function applyStatus(s) {
       const elCamAe = document.getElementById('camAe');
       const elCamGain = document.getElementById('camGain');
       const elCamNight = document.getElementById('camNight');
-      const elCamDn = document.getElementById('camDn');
       if (elCamQual) elCamQual.value = state.camQual;
       if (elCamBri) elCamBri.value = state.camBri;
       if (elCamAe) elCamAe.value = state.camAe;
       if (elCamGain) elCamGain.value = state.camGain;
       if (elCamNight) elCamNight.checked = state.camNight;
-      if (elCamDn) elCamDn.value = state.camDn;
       document.getElementById('mouseSens').value = state.mouseSensitivity;
       document.getElementById('joySens').value = state.joystickSpeedDegPerSec;
       document.getElementById('touchSens').value = state.touchAimSensitivity;
@@ -2032,12 +1997,6 @@ function applyStatus(s) {
           state.camNight = Boolean(s.cam_night);
           const el = document.getElementById('camNight');
           if (el) el.checked = state.camNight;
-        }
-        if (typeof s.cam_dn === 'number' && s.cam_dn !== state.camDn) {
-          state.camDn = s.cam_dn;
-          const el = document.getElementById('camDn');
-          if (el) el.value = state.camDn;
-          camLabelDirty = true;
         }
         if (camLabelDirty) updateLabels();
       }
