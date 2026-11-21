@@ -26,10 +26,10 @@ const CAM_GAIN_NAMES = {
  * - Fires ONLY when at least one parameter actually changed.
  * - Priority:
  *     * 0 ms (immediate) when led or laser changes
- *     * 30 ms minimum interval when only x/y changes
+ *     * 35 ms minimum interval (~28.6 Hz) when only x/y changes
  */
 class SingleFlightController {
-  constructor({ endpoint = '/servo', moveIntervalMs = 30, onDispatch = null } = {}) {
+  constructor({ endpoint = '/servo', moveIntervalMs = 35, onDispatch = null } = {}) {
     this.endpoint = endpoint;
     this.moveIntervalMs = moveIntervalMs;
     this.onDispatch = onDispatch;
@@ -261,7 +261,7 @@ const state = {
   invertY: false,
 
   // Hardware control timing & last payload
-  hwMoveIntervalMs: 20,
+  hwMoveIntervalMs: 35,
   hwLastPayload: '',
 
   // Eco mode
@@ -336,7 +336,7 @@ const swipeAimState = {
 
 const sf = new SingleFlightController({
   endpoint: '/servo',
-  moveIntervalMs: 20,
+  moveIntervalMs: 35,
   onDispatch: ({ url, rttMs, isPriority }) => {
     const roundedRtt = `${Math.round(rttMs)} ms`;
     const elProto = document.getElementById('protoPreview');

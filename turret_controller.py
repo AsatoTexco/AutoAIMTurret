@@ -518,7 +518,7 @@ class TurretHardwareClient:
         * GET /servo -> real-time actuators only (x=0..180, y=0..180, led=0|1, laser=0|1).
           Servos apply immediately (no ramp) with 500 ms PWM Auto-Detach on ESP32; sends minimal
           delta queries ("laser=1", "led=0") when servos are parked so Auto-Detach stays undisturbed.
-          0 ms immediate priority for laser/led; 20 ms minimum interval (50 Hz PWM match) for 30+ FPS motion.
+          0 ms immediate priority for laser/led; 35 ms minimum interval (~28.6 Hz) to cut Port 80/81 Wi-Fi contention.
         * GET /cam -> camera settings (res=0..3, qual=10..40, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
           dispatched with 0 ms priority without waking servos.
     - Safety fail-safe:
@@ -527,7 +527,7 @@ class TurretHardwareClient:
     """
 
     HTTP_MAX_QUERY_CHARS = 95
-    HTTP_MOVE_MIN_INTERVAL_S = 0.020
+    HTTP_MOVE_MIN_INTERVAL_S = 0.035
 
     def __init__(
         self,
@@ -1099,7 +1099,7 @@ class TurretHardwareClient:
                 )
                 continue
 
-            # 3) Throttled servo Pan/Tilt motion (20 ms min interval = 50 Hz MG90S match for smooth 30+ FPS)
+            # 3) Throttled servo Pan/Tilt motion (35 ms min interval = ~28.6 Hz to reduce Port 80/81 Wi-Fi contention)
             move_interval = self.get_effective_move_interval()
             if move_interval > 0.0:
                 elapsed = time.monotonic() - self._last_send_monotonic
@@ -2110,7 +2110,7 @@ class AutoAimEngine:
         self.cam_night: bool = DEFAULT_CAM_NIGHT  # 0|1 (aec2; 0 keeps max FPS indoors)
         self._res_explicit: bool = False
         self.max_step_deg: float = 45.0
-        self.min_servo_interval: float = 0.020
+        self.min_servo_interval: float = 0.035
         self.camera_latency: float = DEFAULT_CAMERA_LATENCY
         self.hold_timeout: float = 0.45
 

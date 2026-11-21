@@ -39,7 +39,7 @@ GET http://<IP_DO_ESP32>/cam?res=1&qual=16&bri=1&ae=1&gain=4&night=0
 **Regras de despacho Single-Flight & Fail-Safe:**
 - Dispara **apenas quando algum valor muda** (mantendo servos em Auto-Detach quando parados).
 - **Prioridade imediata (`0 ms`)** para `laser`/`led` (`/servo`) e ajustes de câmera (`/cam`).
-- **Intervalo de `20 ms`** (`50 Hz`, sincronizado ao PWM dos servos MG90S) para movimento fluido em `30+ FPS` (`x`/`y`).
+- **Intervalo de `35 ms`** (`~28.6 Hz`, alinhado à taxa de frames da câmera) para movimento fluido (`x`/`y`) reduzindo a disputa de Wi-Fi com o stream MJPEG na porta `81`.
 - **Encerramento limpo & Fail-Safe**: fecha explicitamente o socket do `/stream` (porta `81`) ao encerrar/reconectar e envia `GET /servo?laser=0&led=0` ao encerrar o servidor (`SIGINT`/`SIGTERM`/`SIGHUP`/`atexit`), ao perder o stream de vídeo no Auto-Aim/Eco, e ao fechar a aba do navegador com atuadores manuais ligados.
 
 ## Modo FPS — Controle Manual com Mouse Preso (Pointer Lock)
@@ -58,7 +58,7 @@ Clique em **Travar Mouse (FPS)** (ou pressione `M`, ou dê duplo clique no víde
 
 1. **`turret_controller.py`**
    - **`MJPEGStreamReader`**: Consome o stream MJPEG HTTP/1.1 na **Porta 81** (`TCP_NODELAY` + `TCP_QUICKACK` + `Content-Length`), aplica rotação (`0°/90°/180°/270°`) e descarta frames antigos.
-   - **`TurretHardwareClient`**: Fila HTTP *single-flight* em thread dedicada com `Connection: keep-alive` + `TCP_NODELAY` nas rotas `GET /servo` (atuadores em tempo real) e `GET /cam` (ajustes do sensor OV3660), prioridade imediata (`0 ms`) para Laser/Flash e `/cam`, intervalo de `20 ms` para movimento de servos e histórico temporal (`_pose_history`) para compensação de latência.
+   - **`TurretHardwareClient`**: Fila HTTP *single-flight* em thread dedicada com `Connection: keep-alive` + `TCP_NODELAY` nas rotas `GET /servo` (atuadores em tempo real) e `GET /cam` (ajustes do sensor OV3660), prioridade imediata (`0 ms`) para Laser/Flash e `/cam`, intervalo de `35 ms` (`~28.6 Hz`) para movimento de servos e histórico temporal (`_pose_history`) para compensação de latência.
    - **`PersonDetector`**: Suporte multi-classe (`person` e `dog`) com detecção automática de GPU (**Vulkan via ncnn + Mesa RADV para AMD Radeon RX 580** / provedores GPU do ONNX Runtime) e fallback automático para CPU + YuNet.
    - **`AutoAimEngine`**: Controlador visual dinâmico com modos de mira (`Cabeça`, `Peito`, `Centro`), disparo automático configurável (`Laser`, `Flash` ou `Ambos`) e controle manual unificado.
 2. **`app.py` + `templates/index.html` + `static/`**
