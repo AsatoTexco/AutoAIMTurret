@@ -924,9 +924,9 @@
             <div class="slider-field">
               <div class="field-top">
                 <label for="camQual">Qualidade JPEG (qual · menor = mais nítido)</label>
-                <span class="mono-val" id="camQualVal">16</span>
+                <span class="mono-val" id="camQualVal">18</span>
               </div>
-              <input type="range" id="camQual" min="10" max="40" step="1" value="16" oninput="updateLabels()" onchange="onCamQualChange()">
+              <input type="range" id="camQual" min="10" max="40" step="1" value="18" oninput="updateLabels()" onchange="onCamQualChange()">
             </div>
 
             <div class="slider-field">
@@ -940,25 +940,33 @@
             <div class="slider-field">
               <div class="field-top">
                 <label for="camAe">Exposição Auto (ae)</label>
-                <span class="mono-val" id="camAeVal">+2</span>
+                <span class="mono-val" id="camAeVal">+1</span>
               </div>
-              <input type="range" id="camAe" min="-5" max="5" step="1" value="2" oninput="updateLabels()" onchange="onCamAeChange()">
+              <input type="range" id="camAe" min="-5" max="5" step="1" value="1" oninput="updateLabels()" onchange="onCamAeChange()">
             </div>
 
             <div class="slider-field">
               <div class="field-top">
                 <label for="camGain">Ganho Máximo OV3660 (gain)</label>
-                <span class="mono-val" id="camGainVal">64x</span>
+                <span class="mono-val" id="camGainVal">32x</span>
               </div>
-              <input type="range" id="camGain" min="0" max="5" step="1" value="5" oninput="updateLabels()" onchange="onCamGainChange()">
+              <input type="range" id="camGain" min="0" max="5" step="1" value="4" oninput="updateLabels()" onchange="onCamGainChange()">
               <div class="preset-chips cols-6" id="camGainPresets">
                 <button type="button" class="preset-chip" data-gain="0" onclick="setCamGainPreset(0)">2x</button>
                 <button type="button" class="preset-chip" data-gain="1" onclick="setCamGainPreset(1)">4x</button>
                 <button type="button" class="preset-chip" data-gain="2" onclick="setCamGainPreset(2)">8x</button>
                 <button type="button" class="preset-chip" data-gain="3" onclick="setCamGainPreset(3)">16x</button>
-                <button type="button" class="preset-chip" data-gain="4" onclick="setCamGainPreset(4)">32x</button>
-                <button type="button" class="preset-chip active" data-gain="5" onclick="setCamGainPreset(5)">64x</button>
+                <button type="button" class="preset-chip active" data-gain="4" onclick="setCamGainPreset(4)">32x</button>
+                <button type="button" class="preset-chip" data-gain="5" onclick="setCamGainPreset(5)">64x</button>
               </div>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="camDn">Redução de Ruído DSP (dn · 0 = OFF)</label>
+                <span class="mono-val" id="camDnVal">4</span>
+              </div>
+              <input type="range" id="camDn" min="0" max="8" step="1" value="4" oninput="updateLabels()" onchange="onCamDnChange()">
             </div>
 
             <div class="toggle-row">
@@ -973,7 +981,7 @@
             </div>
 
             <button type="button" id="btnCamReset" class="cam-reset-btn" onclick="resetCamDefaults()">
-              Restaurar Padrão OV3660 (qual=16 · bri=+1 · ae=+2 · 64x · night=0)
+              Restaurar Padrão OV3660 (qual=18 · bri=+1 · ae=+1 · 32x · dn=4 · night=0)
             </button>
           </div>
 

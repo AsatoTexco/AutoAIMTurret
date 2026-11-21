@@ -4,6 +4,7 @@ import math
 import os
 import queue
 import socket
+import struct
 import threading
 import time
 import urllib.parse
@@ -60,6 +61,9 @@ _load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 DEFAULT_TURRET_URL = os.environ.get("TURRET_URL", "http://192.168.100.5")
 DEFAULT_STREAM_URL = os.environ.get("STREAM_URL", "http://192.168.100.5:81/stream")
+_RAW_TRANSPORT = os.environ.get("AUTOAIM_STREAM_TRANSPORT", "auto").strip().lower()
+DEFAULT_STREAM_TRANSPORT = _RAW_TRANSPORT if _RAW_TRANSPORT in ("auto", "udp", "http") else "auto"
+DEFAULT_UDP_PORT = max(1, min(65535, int(os.environ.get("AUTOAIM_UDP_PORT", "82"))))
 DEFAULT_BACKEND = os.environ.get("AUTOAIM_BACKEND", "auto").lower()
 DEFAULT_CPU_THREADS = max(1, int(os.environ.get("AUTOAIM_CPU_THREADS", "4")))
 DEFAULT_MAX_FPS = float(os.environ.get("AUTOAIM_MAX_FPS", "30.0"))
@@ -108,11 +112,12 @@ CAM_GAIN_OPTIONS = {
 }
 
 DEFAULT_CAM_RES = 2
-DEFAULT_CAM_QUAL = 16
+DEFAULT_CAM_QUAL = 18
 DEFAULT_CAM_BRI = 1
-DEFAULT_CAM_AE = 2
-DEFAULT_CAM_GAIN = 5
+DEFAULT_CAM_AE = 1
+DEFAULT_CAM_GAIN = 4
 DEFAULT_CAM_NIGHT = False
+DEFAULT_CAM_DENOISE = 4
 
 
 def infer_resolution_code(width: int, height: int) -> int:
@@ -161,24 +166,45 @@ class _TCPNoDelayHTTPAdapter(HTTPAdapter):
 
 
 class MJPEGStreamReader:
-    """Low-latency MJPEG reader tuned for ESP32-CAM port 81 HTTP/1.1 streaming (raw & chunked).
+    """Low-latency video stream reader for ESP32-CAM (UDP port 82 primary + HTTP port 81 fallback).
 
-    - Uses http.client + SO_KEEPALIVE + TCP_QUICKACK (Linux) + read1() for zero-stall multipart frames.
-    - Parses multipart boundary + exact Content-Length headers (with SOI/EOI fallback).
-    - Validates JPEG SOI (0xFF 0xD8), drains stale frames, and decodes only the newest frame.
-    - Notifies consumers immediately via Condition (wait_for_frame) instead of sleep-polling.
-    - Actively shuts down and closes the socket on stop() and reconnects to free port 81's single client slot immediately.
+    - In 'auto' mode (default): subscribes to ESP32 UDP port 82 via periodic "SUB\\x01" heartbeats
+      (100% compatible with Docker bridge NAT), reassembles 12-byte "MJPG" framed datagrams with
+      zero TCP window throttling and zero head-of-line blocking, and seamlessly falls back to HTTP
+      port 81 (/stream) if the firmware does not expose UDP port 82.
+    - HTTP fallback uses http.client + SO_KEEPALIVE + TCP_QUICKACK (Linux) + read1() with exact
+      Content-Length parsing (and SOI/EOI fallback).
+    - Validates JPEG SOI (0xFF 0xD8), decodes only fresh frames, and wakes consumers immediately
+      via Condition (wait_for_frame) instead of sleep-polling.
+    - Clean teardown: transmits "BYE\\x01" on UDP and explicitly closes HTTP sockets on stop().
     """
 
     MAX_JPEG_BYTES = 2 * 1024 * 1024
+    UDP_MAGIC = b"MJPG"
+    UDP_HDR_STRUCT = struct.Struct("<4sIHH")
+    UDP_SUB_CMD = b"SUB\x01"
+    UDP_BYE_CMD = b"BYE\x01"
+    UDP_INITIAL_TIMEOUT_S = 1.8
+    UDP_STALE_TIMEOUT_S = 2.8
 
-    def __init__(self, stream_url: str = DEFAULT_STREAM_URL, rotation: int = 90) -> None:
+    def __init__(
+        self,
+        stream_url: str = DEFAULT_STREAM_URL,
+        rotation: int = 90,
+        transport: str = DEFAULT_STREAM_TRANSPORT,
+        udp_port: int = DEFAULT_UDP_PORT,
+    ) -> None:
         self.stream_url = stream_url
         self._rotation = rotation if rotation in ROTATION_CODES else 90
+        t_pref = (transport or "auto").strip().lower()
+        self._transport_pref: str = t_pref if t_pref in ("auto", "udp", "http") else "auto"
+        self._udp_port: int = max(1, min(65535, int(udp_port)))
         self._lock = threading.Lock()
         self._frame_cond = threading.Condition(self._lock)
         self._conn_lock = threading.Lock()
         self._active_conn: Optional[http.client.HTTPConnection] = None
+        self._active_udp_sock: Optional[socket.socket] = None
+        self._active_udp_peer: Optional[Tuple[str, int]] = None
         self._stop_event = threading.Event()
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_id: int = 0
@@ -188,6 +214,8 @@ class MJPEGStreamReader:
         self._stream_fps: float = 0.0
         self._last_frame_bytes: int = 0
         self._frames_dropped: int = 0
+        self._udp_frames_lost: int = 0
+        self._active_transport: str = "connecting"
         self._thread = threading.Thread(target=self._reader_loop, daemon=True, name="MJPEGReader")
 
     def start(self) -> None:
@@ -200,6 +228,21 @@ class MJPEGStreamReader:
         with self._conn_lock:
             conn = self._active_conn
             self._active_conn = None
+            udp_sock = self._active_udp_sock
+            udp_peer = self._active_udp_peer
+            self._active_udp_sock = None
+            self._active_udp_peer = None
+        if udp_sock is not None:
+            if udp_peer is not None:
+                for _ in range(2):
+                    try:
+                        udp_sock.sendto(self.UDP_BYE_CMD, udp_peer)
+                    except OSError:
+                        break
+            try:
+                udp_sock.close()
+            except Exception:
+                pass
         if conn is not None:
             sock = getattr(conn, "sock", None)
             if sock is not None:
@@ -244,6 +287,8 @@ class MJPEGStreamReader:
                 "stream_fps": self._stream_fps,
                 "last_frame_bytes": self._last_frame_bytes,
                 "frames_dropped": self._frames_dropped,
+                "udp_frames_lost": self._udp_frames_lost,
+                "stream_transport": self._active_transport,
                 "last_error": self._last_error,
             }
 
@@ -372,143 +417,336 @@ class MJPEGStreamReader:
             del buf[: end + 2]
         return newest_jpg, dropped
 
-    def _reader_loop(self) -> None:
-        backoff_s = 0.25
-        prev_frame_mono = 0.0
-        stream_fps_ema = 0.0
-        tcp_quickack_opt = getattr(socket, "TCP_QUICKACK", None)
+    def _publish_jpeg(
+        self,
+        jpg: bytes,
+        dropped: int,
+        transport_name: str,
+        prev_frame_mono: float,
+        stream_fps_ema: float,
+        udp_lost_delta: int = 0,
+    ) -> Tuple[float, float, bool]:
+        arr = np.frombuffer(jpg, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return prev_frame_mono, stream_fps_ema, False
+        with self._lock:
+            rot_code = ROTATION_CODES.get(self._rotation)
+        if rot_code is not None:
+            frame = cv2.rotate(frame, rot_code)
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        if prev_frame_mono > 0.0:
+            dt = max(1e-3, now_mono - prev_frame_mono)
+            inst_fps = 1.0 / dt
+            alpha = 1.0 - math.exp(-dt / 0.8)
+            stream_fps_ema = (
+                inst_fps
+                if stream_fps_ema == 0.0
+                else ((1.0 - alpha) * stream_fps_ema + alpha * inst_fps)
+            )
+        prev_frame_mono = now_mono
+        with self._frame_cond:
+            self._latest_frame = frame
+            self._frame_id += 1
+            self._last_frame_time = now_wall
+            self._connected = True
+            self._active_transport = transport_name
+            self._last_error = ""
+            self._stream_fps = stream_fps_ema
+            self._last_frame_bytes = len(jpg)
+            self._frames_dropped += dropped
+            if udp_lost_delta:
+                self._udp_frames_lost += udp_lost_delta
+            self._frame_cond.notify_all()
+        return prev_frame_mono, stream_fps_ema, True
 
-        while not self._stop_event.is_set():
-            conn: Optional[http.client.HTTPConnection] = None
+    def _run_udp_session(
+        self,
+        host: str,
+        prev_frame_mono: float,
+        stream_fps_ema: float,
+    ) -> Tuple[bool, float, float]:
+        """Run a low-latency UDP streaming session against ESP32 port 82.
+
+        Returns (received_any_frame, prev_frame_mono, stream_fps_ema).
+        """
+        peer = (host, self._udp_port)
+        sock: Optional[socket.socket] = None
+        received_any = False
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                parsed = urllib.parse.urlparse(self.stream_url)
-                use_tls = parsed.scheme.lower() == "https"
-                host = parsed.hostname
-                if not host:
-                    raise ValueError(f"Invalid stream URL: {self.stream_url}")
-                port = parsed.port or (443 if use_tls else 80)
-                path = parsed.path or "/stream"
-                if parsed.query:
-                    path = f"{path}?{parsed.query}"
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+            except OSError:
+                pass
+            sock.settimeout(0.35)
 
-                if use_tls:
-                    conn = http.client.HTTPSConnection(host, port, timeout=4.0)
-                else:
-                    conn = http.client.HTTPConnection(host, port, timeout=4.0)
+            with self._conn_lock:
+                if self._stop_event.is_set():
+                    return False, prev_frame_mono, stream_fps_ema
+                self._active_udp_sock = sock
+                self._active_udp_peer = peer
 
-                with self._conn_lock:
-                    if self._stop_event.is_set():
+            now_mono = time.monotonic()
+            session_start = now_mono
+            last_hb_sent = 0.0
+            last_pkt_mono = now_mono
+
+            cur_fid = -1
+            cur_total = 0
+            cur_chunks: Dict[int, bytes] = {}
+            last_completed_fid = -1
+            pending_lost = 0
+
+            while not self._stop_event.is_set():
+                now_mono = time.monotonic()
+                hb_interval = 1.0 if received_any else 0.45
+                if now_mono - last_hb_sent >= hb_interval:
+                    sock.sendto(self.UDP_SUB_CMD, peer)
+                    last_hb_sent = now_mono
+
+                try:
+                    pkt, _ = sock.recvfrom(2048)
+                except socket.timeout:
+                    now_mono = time.monotonic()
+                    if not received_any and (now_mono - session_start >= self.UDP_INITIAL_TIMEOUT_S):
                         break
-                    self._active_conn = conn
+                    if received_any and (now_mono - last_pkt_mono >= self.UDP_STALE_TIMEOUT_S):
+                        with self._lock:
+                            self._connected = False
+                            self._last_error = f"UDP port {self._udp_port} timeout"
+                        break
+                    continue
+                except ConnectionResetError:
+                    # Windows raises WinError 10054 immediately on ICMP Port Unreachable
+                    if not received_any:
+                        break
+                    continue
 
-                conn.connect()
-                raw_sock = conn.sock
-                if raw_sock is not None:
+                if len(pkt) <= 12 or pkt[:4] != self.UDP_MAGIC:
+                    continue
+
+                _, fid, cidx, total = self.UDP_HDR_STRUCT.unpack_from(pkt, 0)
+                if total == 0 or total > 255 or cidx >= total:
+                    continue
+
+                last_pkt_mono = time.monotonic()
+
+                # Handle ESP32 restart wrap-around (frame_id restarts at 1)
+                if last_completed_fid != -1 and fid < last_completed_fid and (last_completed_fid - fid) > 1000:
+                    last_completed_fid = -1
+                    cur_fid = -1
+                    cur_chunks.clear()
+
+                if fid <= last_completed_fid:
+                    continue
+                if cur_fid != -1 and fid < cur_fid:
+                    continue
+
+                if fid != cur_fid:
+                    if cur_fid != -1 and cur_chunks:
+                        pending_lost += 1
+                    cur_fid = fid
+                    cur_total = total
+                    cur_chunks = {}
+
+                cur_chunks[cidx] = pkt[12:]
+                if len(cur_chunks) == cur_total:
+                    jpg = b"".join(cur_chunks[i] for i in range(cur_total))
+                    cur_chunks.clear()
+                    cur_fid = -1
+                    last_completed_fid = fid
+                    if len(jpg) >= 4 and jpg[0] == 0xFF and jpg[1] == 0xD8:
+                        prev_frame_mono, stream_fps_ema, ok = self._publish_jpeg(
+                            jpg=jpg,
+                            dropped=0,
+                            transport_name="udp",
+                            prev_frame_mono=prev_frame_mono,
+                            stream_fps_ema=stream_fps_ema,
+                            udp_lost_delta=pending_lost,
+                        )
+                        pending_lost = 0
+                        if ok:
+                            received_any = True
+        except Exception as exc:
+            if not self._stop_event.is_set() and (received_any or self._transport_pref == "udp"):
+                with self._lock:
+                    self._connected = False
+                    self._last_error = str(exc)
+        finally:
+            with self._conn_lock:
+                if self._active_udp_sock is sock:
+                    self._active_udp_sock = None
+                    self._active_udp_peer = None
+            if sock is not None:
+                for _ in range(2):
                     try:
-                        # Match ESP32 port 81 socket profile + disable Linux 40ms Delayed ACK
-                        raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                        raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
-                        for opt_name, val in (("TCP_KEEPIDLE", 3), ("TCP_KEEPINTVL", 1), ("TCP_KEEPCNT", 3)):
-                            opt = getattr(socket, opt_name, None)
-                            if opt is not None:
-                                try:
-                                    raw_sock.setsockopt(socket.IPPROTO_TCP, opt, val)
-                                except OSError:
-                                    pass
-                        if tcp_quickack_opt is not None:
+                        sock.sendto(self.UDP_BYE_CMD, peer)
+                    except OSError:
+                        break
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        return received_any, prev_frame_mono, stream_fps_ema
+
+    def _run_http_session(
+        self,
+        parsed: urllib.parse.ParseResult,
+        prev_frame_mono: float,
+        stream_fps_ema: float,
+    ) -> Tuple[bool, float, float]:
+        """Run a persistent HTTP/1.1 port 81 MJPEG stream session (fallback or forced HTTP)."""
+        tcp_quickack_opt = getattr(socket, "TCP_QUICKACK", None)
+        conn: Optional[http.client.HTTPConnection] = None
+        received_any = False
+        try:
+            use_tls = parsed.scheme.lower() == "https"
+            host = parsed.hostname
+            if not host:
+                raise ValueError(f"Invalid stream URL: {self.stream_url}")
+            port = parsed.port or (443 if use_tls else 80)
+            path = parsed.path or "/stream"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+
+            if use_tls:
+                conn = http.client.HTTPSConnection(host, port, timeout=4.0)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=4.0)
+
+            with self._conn_lock:
+                if self._stop_event.is_set():
+                    return False, prev_frame_mono, stream_fps_ema
+                self._active_conn = conn
+
+            conn.connect()
+            raw_sock = conn.sock
+            if raw_sock is not None:
+                try:
+                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+                    for opt_name, val in (("TCP_KEEPIDLE", 3), ("TCP_KEEPINTVL", 1), ("TCP_KEEPCNT", 3)):
+                        opt = getattr(socket, opt_name, None)
+                        if opt is not None:
                             try:
-                                raw_sock.setsockopt(socket.IPPROTO_TCP, tcp_quickack_opt, 1)
+                                raw_sock.setsockopt(socket.IPPROTO_TCP, opt, val)
                             except OSError:
                                 pass
-                    except OSError:
-                        pass
-
-                conn.request(
-                    "GET",
-                    path,
-                    headers={
-                        "Connection": "close",
-                        "Cache-Control": "no-cache",
-                        "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
-                    },
-                )
-                resp = conn.getresponse()
-                if resp.status != 200:
-                    raise ConnectionError(f"Stream HTTP {resp.status} {resp.reason}")
-
-                boundary = self._extract_boundary(resp.getheader("Content-Type", ""))
-                buf = bytearray()
-                backoff_s = 0.25
-
-                while not self._stop_event.is_set():
-                    chunk = resp.read1(32768)
-                    if not chunk:
-                        break
-                    if tcp_quickack_opt is not None and raw_sock is not None:
+                    if tcp_quickack_opt is not None:
                         try:
                             raw_sock.setsockopt(socket.IPPROTO_TCP, tcp_quickack_opt, 1)
                         except OSError:
                             pass
-                    buf.extend(chunk)
+                except OSError:
+                    pass
 
-                    newest_jpg, dropped = self._drain_frames_from_buffer(buf, boundary)
-                    if newest_jpg is not None:
-                        arr = np.frombuffer(newest_jpg, dtype=np.uint8)
-                        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if frame is not None:
-                            with self._lock:
-                                rot_code = ROTATION_CODES.get(self._rotation)
-                            if rot_code is not None:
-                                frame = cv2.rotate(frame, rot_code)
-                            now_wall = time.time()
-                            now_mono = time.monotonic()
-                            if prev_frame_mono > 0.0:
-                                dt = max(1e-3, now_mono - prev_frame_mono)
-                                inst_fps = 1.0 / dt
-                                alpha = 1.0 - math.exp(-dt / 0.8)
-                                stream_fps_ema = (
-                                    inst_fps
-                                    if stream_fps_ema == 0.0
-                                    else ((1.0 - alpha) * stream_fps_ema + alpha * inst_fps)
-                                )
-                            prev_frame_mono = now_mono
-                            with self._frame_cond:
-                                self._latest_frame = frame
-                                self._frame_id += 1
-                                self._last_frame_time = now_wall
-                                self._connected = True
-                                self._last_error = ""
-                                self._stream_fps = stream_fps_ema
-                                self._last_frame_bytes = len(newest_jpg)
-                                self._frames_dropped += dropped
-                                self._frame_cond.notify_all()
-            except Exception as exc:
-                with self._lock:
-                    self._connected = False
-                    self._last_error = str(exc)
-            finally:
-                with self._conn_lock:
-                    if self._active_conn is conn:
-                        self._active_conn = None
-                if conn is not None:
-                    # Explicitly shut down socket to immediately release ESP32 port 81 single-client slot
-                    sock = getattr(conn, "sock", None)
-                    if sock is not None:
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except Exception:
-                            pass
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "Connection": "close",
+                    "Cache-Control": "no-cache",
+                    "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
+                },
+            )
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise ConnectionError(f"Stream HTTP {resp.status} {resp.reason}")
+
+            boundary = self._extract_boundary(resp.getheader("Content-Type", ""))
+            buf = bytearray()
+
+            while not self._stop_event.is_set():
+                chunk = resp.read1(32768)
+                if not chunk:
+                    break
+                if tcp_quickack_opt is not None and raw_sock is not None:
                     try:
-                        conn.close()
+                        raw_sock.setsockopt(socket.IPPROTO_TCP, tcp_quickack_opt, 1)
+                    except OSError:
+                        pass
+                buf.extend(chunk)
+
+                newest_jpg, dropped = self._drain_frames_from_buffer(buf, boundary)
+                if newest_jpg is not None:
+                    prev_frame_mono, stream_fps_ema, ok = self._publish_jpeg(
+                        jpg=newest_jpg,
+                        dropped=dropped,
+                        transport_name="http",
+                        prev_frame_mono=prev_frame_mono,
+                        stream_fps_ema=stream_fps_ema,
+                    )
+                    if ok:
+                        received_any = True
+        except Exception as exc:
+            with self._lock:
+                self._connected = False
+                self._last_error = str(exc)
+        finally:
+            with self._conn_lock:
+                if self._active_conn is conn:
+                    self._active_conn = None
+            if conn is not None:
+                # Explicitly shut down socket to immediately release ESP32 port 81 single-client slot
+                sock = getattr(conn, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
                     except Exception:
                         pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return received_any, prev_frame_mono, stream_fps_ema
+
+    def _reader_loop(self) -> None:
+        backoff_s = 0.25
+        stream_fps_ema = 0.0
+
+        while not self._stop_event.is_set():
+            parsed = urllib.parse.urlparse(self.stream_url)
+            host = parsed.hostname
+            if not host:
+                with self._lock:
+                    self._connected = False
+                    self._last_error = f"Invalid stream URL: {self.stream_url}"
+                self._stop_event.wait(timeout=1.0)
+                continue
+
+            if self._transport_pref == "udp":
+                got_frames, _, stream_fps_ema = self._run_udp_session(
+                    host, 0.0, stream_fps_ema
+                )
+                backoff_s = 0.25 if got_frames else min(1.2, backoff_s * 1.4)
+            elif self._transport_pref == "http":
+                got_frames, _, stream_fps_ema = self._run_http_session(
+                    parsed, 0.0, stream_fps_ema
+                )
+                backoff_s = 0.25 if got_frames else min(1.2, backoff_s * 1.4)
+            else:
+                # Auto mode: prefer UDP port 82; fall back immediately to HTTP port 81 if unavailable
+                got_udp, _, stream_fps_ema = self._run_udp_session(
+                    host, 0.0, stream_fps_ema
+                )
+                if self._stop_event.is_set():
+                    break
+                if got_udp:
+                    backoff_s = 0.25
+                else:
+                    got_http, _, stream_fps_ema = self._run_http_session(
+                        parsed, 0.0, stream_fps_ema
+                    )
+                    backoff_s = 0.25 if got_http else min(1.2, backoff_s * 1.4)
+
             if not self._stop_event.is_set():
                 self._stop_event.wait(timeout=backoff_s)
-                backoff_s = min(1.2, backoff_s * 1.4)
 
 
 class TurretHardwareClient:
@@ -570,6 +808,7 @@ class TurretHardwareClient:
         self._target_cam_ae: Optional[int] = None
         self._target_cam_gain: Optional[int] = None
         self._target_cam_night: Optional[bool] = None
+        self._target_cam_dn: Optional[int] = None
 
         self._sent_cam_res: Optional[int] = None
         self._sent_cam_qual: Optional[int] = None
@@ -577,6 +816,7 @@ class TurretHardwareClient:
         self._sent_cam_ae: Optional[int] = None
         self._sent_cam_gain: Optional[int] = None
         self._sent_cam_night: Optional[bool] = None
+        self._sent_cam_dn: Optional[int] = None
 
         self._last_send_monotonic: float = 0.0
         self._last_rtt_ms: float = 0.0
@@ -638,6 +878,7 @@ class TurretHardwareClient:
         ae: Optional[int] = None,
         gain: Optional[int] = None,
         night: Optional[bool] = None,
+        dn: Optional[int] = None,
         force: bool = False,
     ) -> None:
         changed = False
@@ -683,6 +924,13 @@ class TurretHardwareClient:
                     self._target_cam_night = bnight
                     if force:
                         self._sent_cam_night = None
+                    changed = True
+            if dn is not None:
+                idn = max(0, min(8, int(dn)))
+                if force or idn != self._target_cam_dn or idn != self._sent_cam_dn:
+                    self._target_cam_dn = idn
+                    if force:
+                        self._sent_cam_dn = None
                     changed = True
         if changed:
             self._wakeup_event.set()
@@ -823,13 +1071,24 @@ class TurretHardwareClient:
         tae: Optional[int],
         tgain: Optional[int],
         tnight: Optional[bool],
+        tdn: Optional[int],
         sres: Optional[int],
         squal: Optional[int],
         sbri: Optional[int],
         sae: Optional[int],
         sgain: Optional[int],
         snight: Optional[bool],
-    ) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[bool]]:
+        sdn: Optional[int],
+    ) -> Tuple[
+        str,
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[bool],
+        Optional[int],
+    ]:
         """Build optimal HTTP GET /cam query string (strictly <= 95 chars)."""
         parts: List[str] = []
         out_res: Optional[int] = None
@@ -838,6 +1097,7 @@ class TurretHardwareClient:
         out_ae: Optional[int] = None
         out_gain: Optional[int] = None
         out_night: Optional[bool] = None
+        out_dn: Optional[int] = None
 
         if tres is not None and tres != sres:
             parts.append(f"res={tres}")
@@ -857,11 +1117,14 @@ class TurretHardwareClient:
         if tnight is not None and tnight != snight:
             parts.append(f"night={1 if tnight else 0}")
             out_night = tnight
+        if tdn is not None and tdn != sdn:
+            parts.append(f"dn={tdn}")
+            out_dn = tdn
 
         query = "&".join(parts)
         if len(query) > cls.HTTP_MAX_QUERY_CHARS:
             raise ValueError(f"HTTP /cam query exceeds {cls.HTTP_MAX_QUERY_CHARS} chars: {query}")
-        return query, out_res, out_qual, out_bri, out_ae, out_gain, out_night
+        return query, out_res, out_qual, out_bri, out_ae, out_gain, out_night, out_dn
 
     def _record_servo_sent(
         self,
@@ -900,6 +1163,7 @@ class TurretHardwareClient:
         sent_ae: Optional[int],
         sent_gain: Optional[int],
         sent_night: Optional[bool],
+        sent_dn: Optional[int],
         rtt_ms: float,
         last_url: str,
         last_payload: str,
@@ -917,6 +1181,8 @@ class TurretHardwareClient:
                 self._sent_cam_gain = sent_gain
             if sent_night is not None:
                 self._sent_cam_night = sent_night
+            if sent_dn is not None:
+                self._sent_cam_dn = sent_dn
             self._last_rtt_ms = rtt_ms
             self._last_error = ""
             self._last_url = last_url
@@ -986,15 +1252,17 @@ class TurretHardwareClient:
         tae: Optional[int],
         tgain: Optional[int],
         tnight: Optional[bool],
+        tdn: Optional[int],
         sres: Optional[int],
         squal: Optional[int],
         sbri: Optional[int],
         sae: Optional[int],
         sgain: Optional[int],
         snight: Optional[bool],
+        sdn: Optional[int],
     ) -> bool:
-        query, o_res, o_qual, o_bri, o_ae, o_gain, o_night = self._build_cam_query(
-            tres, tqual, tbri, tae, tgain, tnight, sres, squal, sbri, sae, sgain, snight
+        query, o_res, o_qual, o_bri, o_ae, o_gain, o_night, o_dn = self._build_cam_query(
+            tres, tqual, tbri, tae, tgain, tnight, tdn, sres, squal, sbri, sae, sgain, snight, sdn
         )
         if not query:
             return True
@@ -1011,6 +1279,7 @@ class TurretHardwareClient:
                     sent_ae=o_ae,
                     sent_gain=o_gain,
                     sent_night=o_night,
+                    sent_dn=o_dn,
                     rtt_ms=rtt_ms,
                     last_url=full_url,
                     last_payload=f"GET /cam?{query}",
@@ -1033,21 +1302,23 @@ class TurretHardwareClient:
                 tled, tlaser = self._target_led, self._target_laser
                 sx, sy = self._sent_x, self._sent_y
                 sled, slaser = self._sent_led, self._sent_laser
-                tres, tqual, tbri, tae, tgain, tnight = (
+                tres, tqual, tbri, tae, tgain, tnight, tdn = (
                     self._target_cam_res,
                     self._target_cam_qual,
                     self._target_cam_bri,
                     self._target_cam_ae,
                     self._target_cam_gain,
                     self._target_cam_night,
+                    self._target_cam_dn,
                 )
-                sres, squal, sbri, sae, sgain, snight = (
+                sres, squal, sbri, sae, sgain, snight, sdn = (
                     self._sent_cam_res,
                     self._sent_cam_qual,
                     self._sent_cam_bri,
                     self._sent_cam_ae,
                     self._sent_cam_gain,
                     self._sent_cam_night,
+                    self._sent_cam_dn,
                 )
 
             servo_priority_dirty = (tled != sled) or (tlaser != slaser)
@@ -1058,6 +1329,7 @@ class TurretHardwareClient:
                 or (tae is not None and tae != sae)
                 or (tgain is not None and tgain != sgain)
                 or (tnight is not None and tnight != snight)
+                or (tdn is not None and tdn != sdn)
             )
             servo_move_dirty = (tx != sx) or (ty != sy)
 
@@ -1079,24 +1351,26 @@ class TurretHardwareClient:
             # 2) Immediate 0 ms priority for /cam adjustments (independent of /servo)
             if cam_dirty:
                 with self._lock:
-                    tres, tqual, tbri, tae, tgain, tnight = (
+                    tres, tqual, tbri, tae, tgain, tnight, tdn = (
                         self._target_cam_res,
                         self._target_cam_qual,
                         self._target_cam_bri,
                         self._target_cam_ae,
                         self._target_cam_gain,
                         self._target_cam_night,
+                        self._target_cam_dn,
                     )
-                    sres, squal, sbri, sae, sgain, snight = (
+                    sres, squal, sbri, sae, sgain, snight, sdn = (
                         self._sent_cam_res,
                         self._sent_cam_qual,
                         self._sent_cam_bri,
                         self._sent_cam_ae,
                         self._sent_cam_gain,
                         self._sent_cam_night,
+                        self._sent_cam_dn,
                     )
                 self._dispatch_cam(
-                    tres, tqual, tbri, tae, tgain, tnight, sres, squal, sbri, sae, sgain, snight
+                    tres, tqual, tbri, tae, tgain, tnight, tdn, sres, squal, sbri, sae, sgain, snight, sdn
                 )
                 continue
 
@@ -2068,8 +2342,15 @@ class AutoAimEngine:
         stream_url: str = DEFAULT_STREAM_URL,
         turret_url: str = DEFAULT_TURRET_URL,
         auto_aim: bool = True,
+        stream_transport: str = DEFAULT_STREAM_TRANSPORT,
+        udp_port: int = DEFAULT_UDP_PORT,
     ) -> None:
-        self.reader = MJPEGStreamReader(stream_url=stream_url, rotation=90)
+        self.reader = MJPEGStreamReader(
+            stream_url=stream_url,
+            rotation=90,
+            transport=stream_transport,
+            udp_port=udp_port,
+        )
         self.hardware = TurretHardwareClient(base_url=turret_url)
         self.detector = PersonDetector()
         self.discord = DiscordWebhookLogger()
@@ -2104,11 +2385,12 @@ class AutoAimEngine:
         self.invert_x: bool = False
         self.invert_y: bool = False
         self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF, 2=VGA (30 FPS default), 3=SVGA (max)
-        self.cam_qual: int = DEFAULT_CAM_QUAL  # 10..40 (lower = sharper; 16 = balanced 30 FPS)
+        self.cam_qual: int = DEFAULT_CAM_QUAL  # 10..40 (lower = sharper; 18 = balanced 30 FPS)
         self.cam_bri: int = DEFAULT_CAM_BRI  # -3..3
         self.cam_ae: int = DEFAULT_CAM_AE  # -5..5
-        self.cam_gain: int = DEFAULT_CAM_GAIN  # 0..5 (2x..64x)
+        self.cam_gain: int = DEFAULT_CAM_GAIN  # 0..5 (2x..64x; default 4 = 32x)
         self.cam_night: bool = DEFAULT_CAM_NIGHT  # 0|1 (aec2; 0 keeps locked 30 FPS indoors)
+        self.cam_dn: int = DEFAULT_CAM_DENOISE  # 0..8 (OV3660 DSP denoise; default 4)
         self._res_explicit: bool = False
         self.max_step_deg: float = 45.0
         self.min_servo_interval: float = 0.020
@@ -2365,6 +2647,7 @@ class AutoAimEngine:
             cam_ae: Optional[int] = None
             cam_gain: Optional[int] = None
             cam_night: Optional[bool] = None
+            cam_dn: Optional[int] = None
             cam_dirty = False
             hw_dirty = False
             now = time.time()
@@ -2528,6 +2811,12 @@ class AutoAimEngine:
                     self.cam_night = night_val
                     cam_night = night_val
                     cam_dirty = True
+            if "cam_dn" in cfg and cfg["cam_dn"] is not None:
+                dn_val = max(0, min(8, int(cfg["cam_dn"])))
+                if dn_val != self.cam_dn:
+                    self.cam_dn = dn_val
+                    cam_dn = dn_val
+                    cam_dirty = True
 
             if cam_dirty:
                 self._motion_prev_gray = None
@@ -2539,6 +2828,7 @@ class AutoAimEngine:
                     ae=cam_ae,
                     gain=cam_gain,
                     night=cam_night,
+                    dn=cam_dn,
                 )
 
             if hw_dirty:
@@ -2601,6 +2891,7 @@ class AutoAimEngine:
         ae: Optional[int] = None,
         gain: Optional[int] = None,
         night: Optional[bool] = None,
+        dn: Optional[int] = None,
         force: bool = True,
     ) -> None:
         """Apply camera settings via ESP32 GET /cam (independent from /servo)."""
@@ -2612,6 +2903,7 @@ class AutoAimEngine:
             ae_val: Optional[int] = None
             gain_val: Optional[int] = None
             night_val: Optional[bool] = None
+            dn_val: Optional[int] = None
             any_set = False
 
             if res is not None:
@@ -2639,6 +2931,10 @@ class AutoAimEngine:
                 night_val = bool(night)
                 self.cam_night = night_val
                 any_set = True
+            if dn is not None:
+                dn_val = max(0, min(8, int(dn)))
+                self.cam_dn = dn_val
+                any_set = True
 
             if any_set:
                 self._motion_suppress_until = max(self._motion_suppress_until, now + 1.5)
@@ -2650,17 +2946,19 @@ class AutoAimEngine:
                     ae=ae_val,
                     gain=gain_val,
                     night=night_val,
+                    dn=dn_val,
                     force=force,
                 )
 
     def reset_cam_defaults(self) -> None:
-        """Restore ESP32 OV3660 30 FPS balanced defaults via GET /cam."""
+        """Restore ESP32 OV3660 30 FPS low-noise balanced defaults via GET /cam."""
         self.apply_cam_command(
             qual=DEFAULT_CAM_QUAL,
             bri=DEFAULT_CAM_BRI,
             ae=DEFAULT_CAM_AE,
             gain=DEFAULT_CAM_GAIN,
             night=DEFAULT_CAM_NIGHT,
+            dn=DEFAULT_CAM_DENOISE,
             force=True,
         )
 
@@ -2792,6 +3090,7 @@ class AutoAimEngine:
                 "cam_ae": self.cam_ae,
                 "cam_gain": self.cam_gain,
                 "cam_night": self.cam_night,
+                "cam_dn": self.cam_dn,
                 "frame_size": list(self._frame_size),
                 "person_detected": self._person_detected,
                 "target_type": self._target_type,
@@ -2810,6 +3109,8 @@ class AutoAimEngine:
                 "video_fps": round(self._video_fps, 1),
                 "stream_fps": round(float(stream_stats["stream_fps"]), 1),
                 "stream_frame_kb": round(int(stream_stats["last_frame_bytes"]) / 1024.0, 1),
+                "stream_transport": str(stream_stats["stream_transport"]),
+                "udp_frames_lost": int(stream_stats["udp_frames_lost"]),
                 "stream_error": str(stream_stats["last_error"]),
                 "inference_ms": round(self._inference_ms, 1),
                 "device": self.detector.device_info,

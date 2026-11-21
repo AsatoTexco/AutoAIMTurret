@@ -11,8 +11,10 @@ from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.serving import WSGIRequestHandler
 
 from turret_controller import (
+    DEFAULT_STREAM_TRANSPORT,
     DEFAULT_STREAM_URL,
     DEFAULT_TURRET_URL,
+    DEFAULT_UDP_PORT,
     AutoAimEngine,
 )
 
@@ -112,11 +114,12 @@ def cam_control():
 
     Accepted optional & combinable query parameters (<= 95 chars):
       res=0..3     -> Resolution (0=QVGA, 1=CIF, 2=VGA default 30 FPS, 3=SVGA max)
-      qual=10..40  -> JPEG quality (lower = sharper, default 16)
+      qual=10..40  -> JPEG quality (lower = sharper, default 18)
       bri=-3..3    -> Brightness (default 1)
-      ae=-5..5     -> Auto-exposure level (default 2)
-      gain=0..5    -> OV3660 gainceiling (0=2x..5=64x, default 5)
+      ae=-5..5     -> Auto-exposure level (default 1)
+      gain=0..5    -> OV3660 gainceiling (0=2x..5=64x, default 4 = 32x)
       night=0|1    -> Night mode / aec2 (default 0 for locked 30 FPS)
+      dn=0..8      -> OV3660 hardware DSP denoise (0=OFF, 1..8=ON, default 4)
     """
     if request.method == "OPTIONS":
         return Response("", status=204)
@@ -148,6 +151,7 @@ def cam_control():
     ae = _parse_int("ae")
     gain = _parse_int("gain")
     night = _parse_bool_int("night")
+    dn = _parse_int("dn")
 
     engine.apply_cam_command(
         res=res,
@@ -156,6 +160,7 @@ def cam_control():
         ae=ae,
         gain=gain,
         night=night,
+        dn=dn,
         force=True,
     )
     resp = Response("OK", status=200, mimetype="text/plain")
@@ -256,6 +261,7 @@ def api_action():
             ae=int(data["ae"]) if data.get("ae") is not None else None,
             gain=int(data["gain"]) if data.get("gain") is not None else None,
             night=bool(data["night"]) if data.get("night") is not None else None,
+            dn=int(data["dn"]) if data.get("dn") is not None else None,
             force=True,
         )
     elif action == "reset_cam":
@@ -286,6 +292,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AutoAIM Mini Turret CV Controller")
     parser.add_argument("--turret-url", default=DEFAULT_TURRET_URL, help="Base URL da torreta ESP32-CAM")
     parser.add_argument("--stream-url", default=DEFAULT_STREAM_URL, help="URL do stream MJPEG da torreta")
+    parser.add_argument(
+        "--stream-transport",
+        default=DEFAULT_STREAM_TRANSPORT,
+        choices=("auto", "udp", "http"),
+        help="Transporte de vídeo: auto (UDP:82 com fallback HTTP:81), udp ou http",
+    )
+    parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help="Porta UDP do stream no ESP32")
     parser.add_argument("--host", default="0.0.0.0", help="Host do servidor web Flask")
     parser.add_argument("--port", type=int, default=5000, help="Porta do servidor web Flask")
     parser.add_argument("--no-auto-aim", action="store_true", help="Iniciar em modo manual")
@@ -297,6 +310,8 @@ def main() -> None:
         stream_url=args.stream_url,
         turret_url=args.turret_url,
         auto_aim=not args.no_auto_aim,
+        stream_transport=args.stream_transport,
+        udp_port=args.udp_port,
     )
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, _signal_handler)
@@ -306,8 +321,8 @@ def main() -> None:
 
     engine.start()
     print(
-        f"[AutoAIM] Stream: {args.stream_url} | Controle HTTP: {args.turret_url}/servo | "
-        f"Câmera: {args.turret_url}/cam"
+        f"[AutoAIM] Stream: {args.stream_url} (transporte={args.stream_transport}, UDP:{args.udp_port}) | "
+        f"Controle HTTP: {args.turret_url}/servo | Câmera: {args.turret_url}/cam"
     )
     print(f"[AutoAIM] Dashboard Web disponível em http://localhost:{args.port}/")
 
