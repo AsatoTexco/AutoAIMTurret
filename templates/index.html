@@ -344,13 +344,21 @@
 
                 <div class="drawer-section">
                   <label class="drawer-label">Resolução da Câmera</label>
-                  <div class="res-grid compact-res" id="gameResGrid">
-                    <button type="button" class="res-btn" data-res="4" onclick="selectResolution(4)"><strong>WIDE</strong><span>320×176</span></button>
-                    <button type="button" class="res-btn active" data-res="5" onclick="selectResolution(5)"><strong>WIDE+</strong><span>400×224</span></button>
-                    <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)"><strong>QVGA</strong><span>320×240</span></button>
-                    <button type="button" class="res-btn" data-res="1" onclick="selectResolution(1)"><strong>CIF</strong><span>400×296</span></button>
-                    <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
-                    <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×600</span></button>
+                  <div class="res-grid" id="gameResGrid">
+                    <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)"><strong>QVGA</strong><span>320×176 · 16:9</span></button>
+                    <button type="button" class="res-btn active" data-res="1" onclick="selectResolution(1)"><strong>CIF</strong><span>400×224 · 16:9</span></button>
+                    <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×360 · 16:9</span></button>
+                    <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×448 · 16:9</span></button>
+                  </div>
+                  <div class="toggle-row" style="margin-top: 8px;">
+                    <div>
+                      <div class="row-title">Widescreen 16:9</div>
+                      <div class="row-sub">Horizontal em 90°</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="gameCamWide" checked onchange="onCamWideChange(this.checked)">
+                      <span class="slider"></span>
+                    </label>
                   </div>
                 </div>
               </div>
@@ -898,30 +906,36 @@
           <div class="panel-card">
             <div class="card-header">
               <h2>Resolução da Câmera</h2>
-              <span class="chip-meta">GET /cam · res=0..5</span>
+              <span class="chip-meta">GET /cam · res=0..3 + wide</span>
             </div>
 
             <div class="res-grid" id="resGrid">
-              <button type="button" class="res-btn" data-res="4" onclick="selectResolution(4)">
-                <strong>WIDE 16:9</strong><span>320×176 (Máx FPS)</span>
-              </button>
-              <button type="button" class="res-btn active" data-res="5" onclick="selectResolution(5)">
-                <strong>WIDE+ 16:9</strong><span>400×224 (Padrão)</span>
-              </button>
               <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)">
-                <strong>QVGA</strong><span>320×240</span>
+                <strong>QVGA</strong><span>320×176 · 16:9</span>
               </button>
-              <button type="button" class="res-btn" data-res="1" onclick="selectResolution(1)">
-                <strong>CIF</strong><span>400×296</span>
+              <button type="button" class="res-btn active" data-res="1" onclick="selectResolution(1)">
+                <strong>CIF</strong><span>400×224 · 16:9</span>
               </button>
               <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)">
-                <strong>VGA</strong><span>640×480</span>
+                <strong>VGA</strong><span>640×360 · 16:9</span>
               </button>
               <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)">
-                <strong>SVGA</strong><span>800×600 (Máx)</span>
+                <strong>SVGA</strong><span>800×448 · 16:9</span>
               </button>
             </div>
-            <p class="card-hint">WIDE+ (400×224) captura recorte 9:16 direto no sensor OV3660 para ficar 16:9 horizontal ao girar 90° (~5,5 KB/frame · 25–28 FPS). Alterações são enviadas via GET /cam?res=0..5.</p>
+
+            <div class="toggle-row">
+              <div>
+                <div class="row-title">Modo Widescreen 16:9 (wide=1)</div>
+                <div class="row-sub">Recorte 9:16 direto no OV3660 para ficar horizontal (16:9) após girar 90°</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="camWide" checked onchange="onCamWideChange(this.checked)">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <p class="card-hint">Ativo em todas as 4 resoluções (QVGA 320×176, CIF 400×224, VGA 640×360, SVGA 800×448). Enviado via GET /cam?res=0..3&amp;wide=0|1.</p>
           </div>
 
           <div class="panel-card">

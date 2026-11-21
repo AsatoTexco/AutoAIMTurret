@@ -96,8 +96,13 @@ RESOLUTION_OPTIONS = {
     1: ("CIF", 400, 296),
     2: ("VGA", 640, 480),
     3: ("SVGA", 800, 600),
-    4: ("WIDE", 320, 176),
-    5: ("WIDE+", 400, 224),
+}
+
+WIDE_RESOLUTION_OPTIONS = {
+    0: ("QVGA 16:9", 320, 176),
+    1: ("CIF 16:9", 400, 224),
+    2: ("VGA 16:9", 640, 360),
+    3: ("SVGA 16:9", 800, 448),
 }
 
 CAM_GAIN_OPTIONS = {
@@ -109,7 +114,8 @@ CAM_GAIN_OPTIONS = {
     5: "64x",
 }
 
-DEFAULT_CAM_RES = 5
+DEFAULT_CAM_RES = 1
+DEFAULT_CAM_WIDE = True
 DEFAULT_CAM_QUAL = 16
 DEFAULT_CAM_BRI = 1
 DEFAULT_CAM_AE = 1
@@ -117,20 +123,22 @@ DEFAULT_CAM_GAIN = 4
 DEFAULT_CAM_NIGHT = False
 
 
-def infer_resolution_code(width: int, height: int) -> int:
+def infer_resolution_mode(width: int, height: int) -> Tuple[int, bool]:
     long_edge = max(width, height)
     short_edge = max(1, min(width, height))
-    if (long_edge / float(short_edge)) >= 1.55:
-        return 4 if long_edge <= 360 else 5
-    best_code = 1
+    wide = (long_edge / float(short_edge)) >= 1.55
+    best_code = DEFAULT_CAM_RES
     best_diff = 10**9
-    for code in (0, 1, 2, 3):
-        _, rw, _ = RESOLUTION_OPTIONS[code]
+    for code, (_, rw, _) in RESOLUTION_OPTIONS.items():
         diff = abs(long_edge - rw)
         if diff < best_diff:
             best_diff = diff
             best_code = code
-    return best_code
+    return best_code, wide
+
+
+def infer_resolution_code(width: int, height: int) -> int:
+    return infer_resolution_mode(width, height)[0]
 
 
 @dataclass
@@ -525,7 +533,7 @@ class TurretHardwareClient:
           Servos apply immediately (no ramp) with 500 ms PWM Auto-Detach on ESP32; sends minimal
           delta queries ("laser=1", "led=0") when servos are parked so Auto-Detach stays undisturbed.
           0 ms immediate priority for laser/led; 35 ms minimum interval (~28.6 Hz) to cut Port 80/81 Wi-Fi contention.
-        * GET /cam -> camera settings (res=0..5, qual=10..40, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
+        * GET /cam -> camera settings (res=0..3, wide=0|1, qual=10..40, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
           dispatched with 0 ms priority without waking servos.
     - Safety fail-safe:
         * Always transmits GET /servo?laser=0&led=0 on shutdown() and supports runtime
@@ -570,6 +578,7 @@ class TurretHardwareClient:
 
         # Eventual /cam targets & last-sent values
         self._target_cam_res: Optional[int] = None
+        self._target_cam_wide: Optional[bool] = None
         self._target_cam_qual: Optional[int] = None
         self._target_cam_bri: Optional[int] = None
         self._target_cam_ae: Optional[int] = None
@@ -577,6 +586,7 @@ class TurretHardwareClient:
         self._target_cam_night: Optional[bool] = None
 
         self._sent_cam_res: Optional[int] = None
+        self._sent_cam_wide: Optional[bool] = None
         self._sent_cam_qual: Optional[int] = None
         self._sent_cam_bri: Optional[int] = None
         self._sent_cam_ae: Optional[int] = None
@@ -638,6 +648,7 @@ class TurretHardwareClient:
     def set_cam_settings(
         self,
         res: Optional[int] = None,
+        wide: Optional[bool] = None,
         qual: Optional[int] = None,
         bri: Optional[int] = None,
         ae: Optional[int] = None,
@@ -648,11 +659,18 @@ class TurretHardwareClient:
         changed = False
         with self._lock:
             if res is not None:
-                ires = max(0, min(5, int(res)))
+                ires = max(0, min(3, int(res)))
                 if force or ires != self._target_cam_res or ires != self._sent_cam_res:
                     self._target_cam_res = ires
                     if force:
                         self._sent_cam_res = None
+                    changed = True
+            if wide is not None:
+                bwide = bool(wide)
+                if force or bwide != self._target_cam_wide or bwide != self._sent_cam_wide:
+                    self._target_cam_wide = bwide
+                    if force:
+                        self._sent_cam_wide = None
                     changed = True
             if qual is not None:
                 iqual = max(10, min(40, int(qual)))
@@ -823,21 +841,24 @@ class TurretHardwareClient:
     def _build_cam_query(
         cls,
         tres: Optional[int],
+        twide: Optional[bool],
         tqual: Optional[int],
         tbri: Optional[int],
         tae: Optional[int],
         tgain: Optional[int],
         tnight: Optional[bool],
         sres: Optional[int],
+        swide: Optional[bool],
         squal: Optional[int],
         sbri: Optional[int],
         sae: Optional[int],
         sgain: Optional[int],
         snight: Optional[bool],
-    ) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[bool]]:
+    ) -> Tuple[str, Optional[int], Optional[bool], Optional[int], Optional[int], Optional[int], Optional[int], Optional[bool]]:
         """Build optimal HTTP GET /cam query string (strictly <= 95 chars)."""
         parts: List[str] = []
         out_res: Optional[int] = None
+        out_wide: Optional[bool] = None
         out_qual: Optional[int] = None
         out_bri: Optional[int] = None
         out_ae: Optional[int] = None
@@ -847,6 +868,9 @@ class TurretHardwareClient:
         if tres is not None and tres != sres:
             parts.append(f"res={tres}")
             out_res = tres
+        if twide is not None and twide != swide:
+            parts.append(f"wide={1 if twide else 0}")
+            out_wide = twide
         if tqual is not None and tqual != squal:
             parts.append(f"qual={tqual}")
             out_qual = tqual
@@ -866,7 +890,7 @@ class TurretHardwareClient:
         query = "&".join(parts)
         if len(query) > cls.HTTP_MAX_QUERY_CHARS:
             raise ValueError(f"HTTP /cam query exceeds {cls.HTTP_MAX_QUERY_CHARS} chars: {query}")
-        return query, out_res, out_qual, out_bri, out_ae, out_gain, out_night
+        return query, out_res, out_wide, out_qual, out_bri, out_ae, out_gain, out_night
 
     def _record_servo_sent(
         self,
@@ -900,6 +924,7 @@ class TurretHardwareClient:
     def _record_cam_sent(
         self,
         sent_res: Optional[int],
+        sent_wide: Optional[bool],
         sent_qual: Optional[int],
         sent_bri: Optional[int],
         sent_ae: Optional[int],
@@ -912,6 +937,8 @@ class TurretHardwareClient:
         with self._lock:
             if sent_res is not None:
                 self._sent_cam_res = sent_res
+            if sent_wide is not None:
+                self._sent_cam_wide = sent_wide
             if sent_qual is not None:
                 self._sent_cam_qual = sent_qual
             if sent_bri is not None:
@@ -986,20 +1013,22 @@ class TurretHardwareClient:
     def _dispatch_cam(
         self,
         tres: Optional[int],
+        twide: Optional[bool],
         tqual: Optional[int],
         tbri: Optional[int],
         tae: Optional[int],
         tgain: Optional[int],
         tnight: Optional[bool],
         sres: Optional[int],
+        swide: Optional[bool],
         squal: Optional[int],
         sbri: Optional[int],
         sae: Optional[int],
         sgain: Optional[int],
         snight: Optional[bool],
     ) -> bool:
-        query, o_res, o_qual, o_bri, o_ae, o_gain, o_night = self._build_cam_query(
-            tres, tqual, tbri, tae, tgain, tnight, sres, squal, sbri, sae, sgain, snight
+        query, o_res, o_wide, o_qual, o_bri, o_ae, o_gain, o_night = self._build_cam_query(
+            tres, twide, tqual, tbri, tae, tgain, tnight, sres, swide, squal, sbri, sae, sgain, snight
         )
         if not query:
             return True
@@ -1011,6 +1040,7 @@ class TurretHardwareClient:
             if r.status_code == 200:
                 self._record_cam_sent(
                     sent_res=o_res,
+                    sent_wide=o_wide,
                     sent_qual=o_qual,
                     sent_bri=o_bri,
                     sent_ae=o_ae,
@@ -1038,16 +1068,18 @@ class TurretHardwareClient:
                 tled, tlaser = self._target_led, self._target_laser
                 sx, sy = self._sent_x, self._sent_y
                 sled, slaser = self._sent_led, self._sent_laser
-                tres, tqual, tbri, tae, tgain, tnight = (
+                tres, twide, tqual, tbri, tae, tgain, tnight = (
                     self._target_cam_res,
+                    self._target_cam_wide,
                     self._target_cam_qual,
                     self._target_cam_bri,
                     self._target_cam_ae,
                     self._target_cam_gain,
                     self._target_cam_night,
                 )
-                sres, squal, sbri, sae, sgain, snight = (
+                sres, swide, squal, sbri, sae, sgain, snight = (
                     self._sent_cam_res,
+                    self._sent_cam_wide,
                     self._sent_cam_qual,
                     self._sent_cam_bri,
                     self._sent_cam_ae,
@@ -1058,6 +1090,7 @@ class TurretHardwareClient:
             servo_priority_dirty = (tled != sled) or (tlaser != slaser)
             cam_dirty = (
                 (tres is not None and tres != sres)
+                or (twide is not None and twide != swide)
                 or (tqual is not None and tqual != squal)
                 or (tbri is not None and tbri != sbri)
                 or (tae is not None and tae != sae)
@@ -1084,16 +1117,18 @@ class TurretHardwareClient:
             # 2) Immediate 0 ms priority for /cam adjustments (independent of /servo)
             if cam_dirty:
                 with self._lock:
-                    tres, tqual, tbri, tae, tgain, tnight = (
+                    tres, twide, tqual, tbri, tae, tgain, tnight = (
                         self._target_cam_res,
+                        self._target_cam_wide,
                         self._target_cam_qual,
                         self._target_cam_bri,
                         self._target_cam_ae,
                         self._target_cam_gain,
                         self._target_cam_night,
                     )
-                    sres, squal, sbri, sae, sgain, snight = (
+                    sres, swide, squal, sbri, sae, sgain, snight = (
                         self._sent_cam_res,
+                        self._sent_cam_wide,
                         self._sent_cam_qual,
                         self._sent_cam_bri,
                         self._sent_cam_ae,
@@ -1101,7 +1136,7 @@ class TurretHardwareClient:
                         self._sent_cam_night,
                     )
                 self._dispatch_cam(
-                    tres, tqual, tbri, tae, tgain, tnight, sres, squal, sbri, sae, sgain, snight
+                    tres, twide, tqual, tbri, tae, tgain, tnight, sres, swide, squal, sbri, sae, sgain, snight
                 )
                 continue
 
@@ -2108,7 +2143,8 @@ class AutoAimEngine:
         self.conf_threshold: float = 0.28
         self.invert_x: bool = False
         self.invert_y: bool = False
-        self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=WIDE (320x176), 5=WIDE+ (400x224)
+        self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA
+        self.cam_wide: bool = DEFAULT_CAM_WIDE  # True=16:9 horizontal ao girar 90° (OV3660 set_res_raw)
         self.cam_qual: int = DEFAULT_CAM_QUAL  # 10..40 (lower = sharper; 16 = balanced)
         self.cam_bri: int = DEFAULT_CAM_BRI  # -3..3
         self.cam_ae: int = DEFAULT_CAM_AE  # -5..5
@@ -2497,11 +2533,19 @@ class AutoAimEngine:
                     self._motion_prev_gray = None
                     self._motion_suppress_until = max(self._motion_suppress_until, now + 1.0)
             if "resolution" in cfg and cfg["resolution"] is not None:
-                res_code = max(0, min(5, int(cfg["resolution"])))
+                res_code = max(0, min(3, int(cfg["resolution"])))
                 if res_code != self.resolution or not self._res_explicit:
                     self.resolution = res_code
                     self._res_explicit = True
                     cam_res = res_code
+                    cam_dirty = True
+            cam_wide: Optional[bool] = None
+            if "cam_wide" in cfg and cfg["cam_wide"] is not None:
+                wide_val = bool(cfg["cam_wide"])
+                if wide_val != self.cam_wide or not self._res_explicit:
+                    self.cam_wide = wide_val
+                    self._res_explicit = True
+                    cam_wide = wide_val
                     cam_dirty = True
             if "cam_qual" in cfg and cfg["cam_qual"] is not None:
                 qual_val = max(10, min(40, int(cfg["cam_qual"])))
@@ -2539,6 +2583,7 @@ class AutoAimEngine:
                 self._motion_suppress_until = max(self._motion_suppress_until, now + 1.5)
                 self.hardware.set_cam_settings(
                     res=cam_res,
+                    wide=cam_wide,
                     qual=cam_qual,
                     bri=cam_bri,
                     ae=cam_ae,
@@ -2601,6 +2646,7 @@ class AutoAimEngine:
     def apply_cam_command(
         self,
         res: Optional[int] = None,
+        wide: Optional[bool] = None,
         qual: Optional[int] = None,
         bri: Optional[int] = None,
         ae: Optional[int] = None,
@@ -2612,6 +2658,7 @@ class AutoAimEngine:
         with self._lock:
             now = time.time()
             res_code: Optional[int] = None
+            wide_val: Optional[bool] = None
             qual_val: Optional[int] = None
             bri_val: Optional[int] = None
             ae_val: Optional[int] = None
@@ -2620,8 +2667,13 @@ class AutoAimEngine:
             any_set = False
 
             if res is not None:
-                res_code = max(0, min(5, int(res)))
+                res_code = max(0, min(3, int(res)))
                 self.resolution = res_code
+                self._res_explicit = True
+                any_set = True
+            if wide is not None:
+                wide_val = bool(wide)
+                self.cam_wide = wide_val
                 self._res_explicit = True
                 any_set = True
             if qual is not None:
@@ -2650,6 +2702,7 @@ class AutoAimEngine:
                 self._motion_prev_gray = None
                 self.hardware.set_cam_settings(
                     res=res_code,
+                    wide=wide_val,
                     qual=qual_val,
                     bri=bri_val,
                     ae=ae_val,
@@ -2792,6 +2845,7 @@ class AutoAimEngine:
                 "invert_y": self.invert_y,
                 "rotation": rotation,
                 "resolution": self.resolution,
+                "cam_wide": self.cam_wide,
                 "cam_qual": self.cam_qual,
                 "cam_bri": self.cam_bri,
                 "cam_ae": self.cam_ae,
@@ -3056,7 +3110,7 @@ class AutoAimEngine:
             with self._lock:
                 self._frame_size = [w, h]
                 if not self._res_explicit:
-                    self.resolution = infer_resolution_code(w, h)
+                    self.resolution, self.cam_wide = infer_resolution_mode(w, h)
 
                 if sampled_motion:
                     if ambient_luma_sample is not None:

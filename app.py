@@ -111,7 +111,8 @@ def cam_control():
     """Camera settings route mirroring ESP32-CAM GET /cam on port 80 (OV3660).
 
     Accepted optional & combinable query parameters (<= 95 chars):
-      res=0..5     -> Resolution (0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=WIDE 320x176, 5=WIDE+ 400x224 default)
+      res=0..3     -> Resolution (0=QVGA, 1=CIF default, 2=VGA, 3=SVGA)
+      wide=0|1     -> 16:9 horizontal crop on OV3660 (1=on default, 0=4:3 normal)
       qual=10..40  -> JPEG quality (lower = sharper, default 16)
       bri=-3..3    -> Brightness (default 1)
       ae=-5..5     -> Auto-exposure level (default 1)
@@ -143,6 +144,7 @@ def cam_control():
             return raw.lower() in ("true", "on")
 
     res = _parse_int("res")
+    wide = _parse_bool_int("wide")
     qual = _parse_int("qual")
     bri = _parse_int("bri")
     ae = _parse_int("ae")
@@ -151,6 +153,7 @@ def cam_control():
 
     engine.apply_cam_command(
         res=res,
+        wide=wide,
         qual=qual,
         bri=bri,
         ae=ae,
@@ -251,6 +254,7 @@ def api_action():
     elif action == "set_cam":
         engine.apply_cam_command(
             res=int(data["res"]) if data.get("res") is not None else None,
+            wide=bool(data["wide"]) if data.get("wide") is not None else None,
             qual=int(data["qual"]) if data.get("qual") is not None else None,
             bri=int(data["bri"]) if data.get("bri") is not None else None,
             ae=int(data["ae"]) if data.get("ae") is not None else None,

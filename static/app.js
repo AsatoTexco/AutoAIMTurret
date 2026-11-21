@@ -8,9 +8,15 @@ const RES_NAMES = {
   1: 'CIF (400×296)',
   2: 'VGA (640×480)',
   3: 'SVGA (800×600)',
-  4: 'WIDE (320×176 · 16:9)',
-  5: 'WIDE+ (400×224 · 16:9)',
 };
+const RES_NAMES_WIDE = {
+  0: 'QVGA (320×176 · 16:9)',
+  1: 'CIF (400×224 · 16:9)',
+  2: 'VGA (640×360 · 16:9)',
+  3: 'SVGA (800×448 · 16:9)',
+};
+const RES_SUBS_4X3 = { 0: '320×240', 1: '400×296', 2: '640×480', 3: '800×600' };
+const RES_SUBS_WIDE = { 0: '320×176 · 16:9', 1: '400×224 · 16:9', 2: '640×360 · 16:9', 3: '800×448 · 16:9' };
 const CAM_GAIN_NAMES = {
   0: '2x',
   1: '4x',
@@ -250,7 +256,8 @@ const state = {
   autoAim: true,
   aimMode: 'center',
   rotation: 90,
-  resolution: 5,
+  resolution: 1,
+  camWide: true,
   camQual: 16,
   camBri: 1,
   camAe: 1,
@@ -1273,7 +1280,10 @@ function setRotation(rot) {
 async function sendCamCommand(patch = {}) {
   const params = new URLSearchParams();
   if (patch.res !== undefined && patch.res !== null) {
-    params.set('res', String(Math.max(0, Math.min(5, parseInt(patch.res, 10)))));
+    params.set('res', String(Math.max(0, Math.min(3, parseInt(patch.res, 10)))));
+  }
+  if (patch.wide !== undefined && patch.wide !== null) {
+    params.set('wide', patch.wide ? '1' : '0');
   }
   if (patch.qual !== undefined && patch.qual !== null) {
     params.set('qual', String(Math.max(10, Math.min(40, parseInt(patch.qual, 10)))));
@@ -1306,11 +1316,20 @@ async function sendCamCommand(patch = {}) {
 }
 
 function selectResolution(code) {
-  const clamped = Math.max(0, Math.min(5, parseInt(code, 10)));
+  const clamped = Math.max(0, Math.min(3, parseInt(code, 10)));
   state.resolution = clamped;
-  renderResolutionGrid(clamped);
-  sendCamCommand({ res: clamped });
-  showToast(`Resolução (/cam): ${RES_NAMES[clamped] || clamped}`, 1800);
+  renderResolutionGrid(clamped, state.camWide);
+  sendCamCommand({ res: clamped, wide: state.camWide });
+  const label = (state.camWide ? RES_NAMES_WIDE : RES_NAMES)[clamped] || clamped;
+  showToast(`Resolução (/cam): ${label}`, 1800);
+}
+
+function onCamWideChange(checked) {
+  state.camWide = Boolean(checked);
+  renderResolutionGrid(state.resolution, state.camWide);
+  sendCamCommand({ res: state.resolution, wide: state.camWide });
+  const label = (state.camWide ? RES_NAMES_WIDE : RES_NAMES)[state.resolution] || state.resolution;
+  showToast(`Formato: ${label}`, 1800);
 }
 
 function onCamQualChange() {
@@ -1380,10 +1399,18 @@ function renderSegmented(selector, attr, activeValue) {
   });
 }
 
-function renderResolutionGrid(activeCode) {
+function renderResolutionGrid(activeCode, isWide = state.camWide) {
+  const subs = isWide ? RES_SUBS_WIDE : RES_SUBS_4X3;
   document.querySelectorAll('#resGrid .res-btn, #gameResGrid .res-btn').forEach((btn) => {
-    btn.classList.toggle('active', parseInt(btn.dataset.res, 10) === activeCode);
+    const code = parseInt(btn.dataset.res, 10);
+    btn.classList.toggle('active', code === activeCode);
+    const span = btn.querySelector('span');
+    if (span && subs[code]) span.textContent = subs[code];
   });
+  const elWide = document.getElementById('camWide');
+  const elGameWide = document.getElementById('gameCamWide');
+  if (elWide) elWide.checked = Boolean(isWide);
+  if (elGameWide) elGameWide.checked = Boolean(isWide);
 }
 
 async function sendConfig(extra = {}) {
@@ -1878,7 +1905,8 @@ function applyStatus(s) {
       state.autoAim = Boolean(s.auto_aim);
       state.aimMode = s.aim_mode || 'center';
       state.rotation = s.rotation ?? 90;
-      state.resolution = Math.max(0, Math.min(5, s.resolution ?? 5));
+      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 1));
+      state.camWide = s.cam_wide !== undefined ? Boolean(s.cam_wide) : true;
       state.camQual = typeof s.cam_qual === 'number' ? s.cam_qual : 16;
       state.camBri = typeof s.cam_bri === 'number' ? s.cam_bri : 1;
       state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 1;
@@ -1949,7 +1977,7 @@ function applyStatus(s) {
       renderSegmented('#aimModeSeg', 'val', state.aimMode);
       renderSegmented('#gameAimModeSeg', 'val', state.aimMode);
       renderSegmented('#rotationSeg', 'rot', String(state.rotation));
-      renderResolutionGrid(state.resolution);
+      renderResolutionGrid(state.resolution, state.camWide);
       renderModeButtons();
       updateLabels();
       syncDrawerInputs();
@@ -1966,9 +1994,20 @@ function applyStatus(s) {
       state.manualX = s.servo_x;
       state.manualY = s.servo_y;
       if (performance.now() - state.lastCamSentAt > 1200) {
+        let resModeDirty = false;
         if (typeof s.resolution === 'number') {
-          state.resolution = Math.max(0, Math.min(5, s.resolution));
-          renderResolutionGrid(state.resolution);
+          const nextRes = Math.max(0, Math.min(3, s.resolution));
+          if (nextRes !== state.resolution) {
+            state.resolution = nextRes;
+            resModeDirty = true;
+          }
+        }
+        if (s.cam_wide !== undefined && Boolean(s.cam_wide) !== state.camWide) {
+          state.camWide = Boolean(s.cam_wide);
+          resModeDirty = true;
+        }
+        if (resModeDirty) {
+          renderResolutionGrid(state.resolution, state.camWide);
         }
         let camLabelDirty = false;
         if (typeof s.cam_qual === 'number' && s.cam_qual !== state.camQual) {
