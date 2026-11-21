@@ -8,17 +8,24 @@ const RES_NAMES = {
   1: 'CIF (400×296)',
   2: 'VGA (640×480)',
   3: 'SVGA (800×600)',
-  4: 'XGA (1024×768)',
-  5: 'UXGA (1600×1200)',
+};
+const CAM_GAIN_NAMES = {
+  0: '2x',
+  1: '4x',
+  2: '8x',
+  3: '16x',
+  4: '32x',
+  5: '64x',
 };
 
 /**
- * Single-Flight HTTP dispatcher for GET /servo.
+ * Single-Flight HTTP dispatcher for real-time GET /servo (x, y, laser, led only).
+ * Camera settings (res, bri, ae, gain, night) use separate GET /cam calls.
  *
- * - Sends x, y, led, laser (and res when changed) together in a single request.
+ * - Sends only changed parameters (preserving ESP32 500 ms servo Auto-Detach when toggling Laser/Flash).
  * - Fires ONLY when at least one parameter actually changed.
  * - Priority:
- *     * 0 ms (immediate) when led, laser, or res changes
+ *     * 0 ms (immediate) when led or laser changes
  *     * 30 ms minimum interval when only x/y changes
  */
 class SingleFlightController {
@@ -27,15 +34,15 @@ class SingleFlightController {
     this.moveIntervalMs = moveIntervalMs;
     this.onDispatch = onDispatch;
 
-    this.desired = { x: 90, y: 90, led: 0, laser: 0, res: null };
-    this.sent = { x: 90, y: 90, led: 0, laser: 0, res: null };
+    this.desired = { x: 90, y: 90, led: 0, laser: 0 };
+    this.sent = { x: 90, y: 90, led: 0, laser: 0 };
     this.sendAngles = false;
 
     this.inFlight = false;
     this.timerId = null;
     this.lastSendAt = 0;
     this.lastRttMs = null;
-    this.lastUrl = '/servo?x=90&y=90&led=0&laser=0';
+    this.lastUrl = '/servo?x=90&y=90&laser=0&led=0';
     this.lastPriority = false;
     this.errorBackoffMs = 250;
     this.maxErrorBackoffMs = 2000;
@@ -44,7 +51,7 @@ class SingleFlightController {
   }
 
   /** Sync local baseline from server telemetry without triggering a network send. */
-  syncFromServer({ x, y, led, laser, res }) {
+  syncFromServer({ x, y, led, laser }) {
     if (this.inFlight || this.hasPending()) return;
     if (typeof x === 'number') {
       this.desired.x = Math.round(x);
@@ -63,10 +70,6 @@ class SingleFlightController {
       const v = laser ? 1 : 0;
       this.desired.laser = v;
       this.sent.laser = v;
-    }
-    if (typeof res === 'number') {
-      this.desired.res = res;
-      this.sent.res = res;
     }
   }
 
@@ -88,17 +91,13 @@ class SingleFlightController {
     if (patch.laser !== undefined) {
       this.desired.laser = patch.laser ? 1 : 0;
     }
-    if (patch.res !== undefined && patch.res !== null) {
-      this.desired.res = Math.max(0, Math.min(5, parseInt(patch.res, 10)));
-    }
     this.schedule();
   }
 
   isPriorityDirty() {
     return (
       this.desired.led !== this.sent.led ||
-      this.desired.laser !== this.sent.laser ||
-      (this.desired.res !== null && this.desired.res !== this.sent.res)
+      this.desired.laser !== this.sent.laser
     );
   }
 
@@ -170,24 +169,31 @@ class SingleFlightController {
       y: this.desired.y,
       led: this.desired.led,
       laser: this.desired.laser,
-      res: this.desired.res,
       includeAngles: this.sendAngles,
     };
 
+    const anglesDirty =
+      snap.includeAngles && (snap.x !== this.sent.x || snap.y !== this.sent.y);
+    const ledDirty = snap.led !== this.sent.led;
+    const laserDirty = snap.laser !== this.sent.laser;
+
     const params = new URLSearchParams();
-    if (snap.includeAngles) {
+    if (anglesDirty) {
       params.set('x', String(snap.x));
       params.set('y', String(snap.y));
     }
-    params.set('led', String(snap.led));
-    params.set('laser', String(snap.laser));
-
-    const includeRes = snap.res !== null && snap.res !== this.sent.res;
-    if (includeRes) {
-      params.set('res', String(snap.res));
+    if (anglesDirty || laserDirty) {
+      params.set('laser', String(snap.laser));
+    }
+    if (anglesDirty || ledDirty) {
+      params.set('led', String(snap.led));
+    }
+    const qs = params.toString();
+    if (!qs) {
+      return;
     }
 
-    const url = `${this.endpoint}?${params.toString()}`;
+    const url = `${this.endpoint}?${qs}`;
     this.inFlight = true;
     this.lastSendAt = performance.now();
     this.lastPriority = isPriority;
@@ -202,14 +208,15 @@ class SingleFlightController {
         succeeded = true;
         this.consecutiveErrors = 0;
         this.retryAfterTs = 0;
-        if (snap.includeAngles) {
+        if (anglesDirty) {
           this.sent.x = snap.x;
           this.sent.y = snap.y;
         }
-        this.sent.led = snap.led;
-        this.sent.laser = snap.laser;
-        if (includeRes) {
-          this.sent.res = snap.res;
+        if (anglesDirty || ledDirty) {
+          this.sent.led = snap.led;
+        }
+        if (anglesDirty || laserDirty) {
+          this.sent.laser = snap.laser;
         }
         this.lastRttMs = rtt;
         if (this.onDispatch) {
@@ -242,10 +249,19 @@ const state = {
   aimMode: 'center',
   rotation: 90,
   resolution: 3,
+  camBri: 1,
+  camAe: 3,
+  camGain: 5,
+  camNight: true,
+  lastCamSentAt: 0,
   autoFireLaser: true,
   autoFireLed: false,
   invertX: false,
   invertY: false,
+
+  // Hardware control timing & last payload
+  hwMoveIntervalMs: 30,
+  hwLastPayload: '',
 
   // Eco mode
   ecoMode: true,
@@ -329,7 +345,11 @@ const sf = new SingleFlightController({
     const elGameRtt = document.getElementById('gameHudRtt');
     if (elGameRtt) elGameRtt.textContent = `${Math.round(rttMs)}ms`;
     const elTag = document.getElementById('mPriorityTag');
-    if (elTag) elTag.textContent = isPriority ? '0 ms IMEDIATO (Laser/Flash/Res)' : '30 ms Movimento';
+    if (elTag) {
+      elTag.textContent = isPriority
+        ? '0ms IMEDIATO (Laser/Flash)'
+        : `${state.hwMoveIntervalMs}ms Movimento`;
+    }
   },
 });
 
@@ -365,7 +385,7 @@ function getEffectiveManualLed() {
   return state.latchLed || state.holdLedBtn || state.mouseLedHeld;
 }
 
-function pushUnifiedManualState({ includeAngles = !state.autoAim, res = undefined } = {}) {
+function pushUnifiedManualState({ includeAngles = !state.autoAim } = {}) {
   state.lastManualInputAt = performance.now();
   const patch = {
     led: getEffectiveManualLed(),
@@ -375,9 +395,6 @@ function pushUnifiedManualState({ includeAngles = !state.autoAim, res = undefine
   if (includeAngles) {
     patch.x = state.manualX;
     patch.y = state.manualY;
-  }
-  if (res !== undefined) {
-    patch.res = res;
   }
   sf.update(patch);
   renderManualVisuals();
@@ -930,6 +947,9 @@ function centerTurret() {
   state.manualY = 90.0;
   triggerHaptic(8);
   if (!state.autoAim) {
+    // Force transmission of 90,90 even if local cache already holds 90,90
+    sf.sent.x = null;
+    sf.sent.y = null;
     pushUnifiedManualState({ includeAngles: true });
   } else {
     fetch('/api/action', {
@@ -1081,6 +1101,25 @@ function updateLabels() {
   document.querySelectorAll('#discordCooldownPresets .preset-chip').forEach((btn) => {
     btn.classList.toggle('active', parseInt(btn.dataset.cd, 10) === cdVal);
   });
+
+  const briEl = document.getElementById('camBri');
+  const aeEl = document.getElementById('camAe');
+  const gainEl = document.getElementById('camGain');
+  const briVal = briEl ? parseInt(briEl.value, 10) : state.camBri;
+  const aeVal = aeEl ? parseInt(aeEl.value, 10) : state.camAe;
+  const gainVal = gainEl ? parseInt(gainEl.value, 10) : state.camGain;
+  if (briEl) {
+    document.getElementById('camBriVal').textContent = briVal > 0 ? `+${briVal}` : String(briVal);
+  }
+  if (aeEl) {
+    document.getElementById('camAeVal').textContent = aeVal > 0 ? `+${aeVal}` : String(aeVal);
+  }
+  if (gainEl) {
+    document.getElementById('camGainVal').textContent = CAM_GAIN_NAMES[gainVal] || `${gainVal}`;
+  }
+  document.querySelectorAll('#camGainPresets .preset-chip').forEach((btn) => {
+    btn.classList.toggle('active', parseInt(btn.dataset.gain, 10) === gainVal);
+  });
 }
 
 function onDiscordConfigChange() {
@@ -1223,11 +1262,95 @@ function setRotation(rot) {
   sendConfig({ rotation: rot });
 }
 
+async function sendCamCommand(patch = {}) {
+  const params = new URLSearchParams();
+  if (patch.res !== undefined && patch.res !== null) {
+    params.set('res', String(Math.max(0, Math.min(3, parseInt(patch.res, 10)))));
+  }
+  if (patch.bri !== undefined && patch.bri !== null) {
+    params.set('bri', String(Math.max(-3, Math.min(3, parseInt(patch.bri, 10)))));
+  }
+  if (patch.ae !== undefined && patch.ae !== null) {
+    params.set('ae', String(Math.max(-5, Math.min(5, parseInt(patch.ae, 10)))));
+  }
+  if (patch.gain !== undefined && patch.gain !== null) {
+    params.set('gain', String(Math.max(0, Math.min(5, parseInt(patch.gain, 10)))));
+  }
+  if (patch.night !== undefined && patch.night !== null) {
+    params.set('night', patch.night ? '1' : '0');
+  }
+  const qs = params.toString();
+  if (!qs) return;
+
+  state.lastCamSentAt = performance.now();
+  const url = `/cam?${qs}`;
+  const elProto = document.getElementById('protoPreview');
+  if (elProto) elProto.textContent = `GET ${url}`;
+
+  try {
+    await fetch(url, { method: 'GET', cache: 'no-store' });
+  } catch (_err) {
+    // ignore transient network errors
+  }
+}
+
 function selectResolution(code) {
-  state.resolution = code;
-  renderResolutionGrid(code);
-  pushUnifiedManualState({ includeAngles: !state.autoAim, res: code });
-  showToast(`Resolução enviada: ${RES_NAMES[code] || code}`, 1800);
+  const clamped = Math.max(0, Math.min(3, parseInt(code, 10)));
+  state.resolution = clamped;
+  renderResolutionGrid(clamped);
+  sendCamCommand({ res: clamped });
+  showToast(`Resolução (/cam): ${RES_NAMES[clamped] || clamped}`, 1800);
+}
+
+function onCamBriChange() {
+  const val = Math.max(-3, Math.min(3, parseInt(document.getElementById('camBri').value, 10)));
+  state.camBri = val;
+  updateLabels();
+  sendCamCommand({ bri: val });
+}
+
+function onCamAeChange() {
+  const val = Math.max(-5, Math.min(5, parseInt(document.getElementById('camAe').value, 10)));
+  state.camAe = val;
+  updateLabels();
+  sendCamCommand({ ae: val });
+}
+
+function onCamGainChange() {
+  const val = Math.max(0, Math.min(5, parseInt(document.getElementById('camGain').value, 10)));
+  state.camGain = val;
+  updateLabels();
+  sendCamCommand({ gain: val });
+}
+
+function setCamGainPreset(gainVal) {
+  const el = document.getElementById('camGain');
+  if (el) el.value = String(gainVal);
+  onCamGainChange();
+}
+
+function onCamNightChange() {
+  const val = Boolean(document.getElementById('camNight').checked);
+  state.camNight = val;
+  sendCamCommand({ night: val });
+}
+
+function resetCamDefaults() {
+  state.camBri = 1;
+  state.camAe = 3;
+  state.camGain = 5;
+  state.camNight = true;
+  const elBri = document.getElementById('camBri');
+  const elAe = document.getElementById('camAe');
+  const elGain = document.getElementById('camGain');
+  const elNight = document.getElementById('camNight');
+  if (elBri) elBri.value = '1';
+  if (elAe) elAe.value = '3';
+  if (elGain) elGain.value = '5';
+  if (elNight) elNight.checked = true;
+  updateLabels();
+  sendCamCommand({ bri: 1, ae: 3, gain: 5, night: true });
+  showToast('Sensor OV3660 restaurado (bri=+1, ae=+3, 64x, night=1)', 2000);
 }
 
 function renderSegmented(selector, attr, activeValue) {
@@ -1640,10 +1763,33 @@ function applyStatus(s) {
       document.getElementById('mFrameRes').textContent = vidFpsInfo;
     }
 
+    if (typeof s.hw_move_interval_ms === 'number' && s.hw_move_interval_ms >= 10) {
+      state.hwMoveIntervalMs = s.hw_move_interval_ms;
+      sf.moveIntervalMs = s.hw_move_interval_ms;
+    }
+    if (typeof s.hw_last_payload === 'string' && s.hw_last_payload) {
+      state.hwLastPayload = s.hw_last_payload;
+      const elProto = document.getElementById('protoPreview');
+      if (elProto) elProto.textContent = s.hw_last_payload;
+    }
+
+    const hwInfo = document.getElementById('metaTransportInfo');
+    const manualBadge = document.getElementById('manualStatusBadge');
+    if (hwInfo) {
+      hwInfo.textContent = `HTTP keep-alive (/servo + /cam) · ${state.hwMoveIntervalMs} ms · Auto-Detach 500ms`;
+    }
+    if (manualBadge) {
+      manualBadge.textContent = `${state.hwMoveIntervalMs} ms HTTP · Single-Flight`;
+    }
+
     if (sf.lastRttMs === null && typeof s.hw_rtt_ms === 'number') {
       document.getElementById('mRtt').textContent = `${Math.round(s.hw_rtt_ms)} ms`;
       const gRtt = document.getElementById('gameHudRtt');
       if (gRtt) gRtt.textContent = `${Math.round(s.hw_rtt_ms)}ms`;
+      const elTag = document.getElementById('mPriorityTag');
+      if (elTag) {
+        elTag.textContent = `0ms Prio · ${state.hwMoveIntervalMs}ms Mov`;
+      }
     }
 
     if (s.turret_url) {
@@ -1707,7 +1853,11 @@ function applyStatus(s) {
       state.autoAim = Boolean(s.auto_aim);
       state.aimMode = s.aim_mode || 'center';
       state.rotation = s.rotation ?? 90;
-      state.resolution = s.resolution ?? 3;
+      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 3));
+      state.camBri = typeof s.cam_bri === 'number' ? s.cam_bri : 1;
+      state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 3;
+      state.camGain = typeof s.cam_gain === 'number' ? s.cam_gain : 5;
+      state.camNight = s.cam_night !== undefined ? Boolean(s.cam_night) : true;
       state.autoFireLaser = s.auto_fire_laser !== undefined ? Boolean(s.auto_fire_laser) : true;
       state.autoFireLed = s.auto_fire_led !== undefined ? Boolean(s.auto_fire_led) : false;
       state.invertX = Boolean(s.invert_x);
@@ -1753,6 +1903,14 @@ function applyStatus(s) {
       document.getElementById('conf').value = s.conf_threshold;
       document.getElementById('invX').checked = state.invertX;
       document.getElementById('invY').checked = state.invertY;
+      const elCamBri = document.getElementById('camBri');
+      const elCamAe = document.getElementById('camAe');
+      const elCamGain = document.getElementById('camGain');
+      const elCamNight = document.getElementById('camNight');
+      if (elCamBri) elCamBri.value = state.camBri;
+      if (elCamAe) elCamAe.value = state.camAe;
+      if (elCamGain) elCamGain.value = state.camGain;
+      if (elCamNight) elCamNight.checked = state.camNight;
       document.getElementById('mouseSens').value = state.mouseSensitivity;
       document.getElementById('joySens').value = state.joystickSpeedDegPerSec;
       document.getElementById('touchSens').value = state.touchAimSensitivity;
@@ -1773,15 +1931,43 @@ function applyStatus(s) {
         y: s.servo_y,
         led: s.manual_led,
         laser: s.manual_laser,
-        res: s.resolution,
       });
 
       state.initialized = true;
     } else if ((state.autoAim && s.auto_aim) || !recentlyControlled) {
       state.manualX = s.servo_x;
       state.manualY = s.servo_y;
-      state.resolution = s.resolution ?? state.resolution;
-      renderResolutionGrid(state.resolution);
+      if (performance.now() - state.lastCamSentAt > 1200) {
+        if (typeof s.resolution === 'number') {
+          state.resolution = Math.max(0, Math.min(3, s.resolution));
+          renderResolutionGrid(state.resolution);
+        }
+        let camLabelDirty = false;
+        if (typeof s.cam_bri === 'number' && s.cam_bri !== state.camBri) {
+          state.camBri = s.cam_bri;
+          const el = document.getElementById('camBri');
+          if (el) el.value = state.camBri;
+          camLabelDirty = true;
+        }
+        if (typeof s.cam_ae === 'number' && s.cam_ae !== state.camAe) {
+          state.camAe = s.cam_ae;
+          const el = document.getElementById('camAe');
+          if (el) el.value = state.camAe;
+          camLabelDirty = true;
+        }
+        if (typeof s.cam_gain === 'number' && s.cam_gain !== state.camGain) {
+          state.camGain = s.cam_gain;
+          const el = document.getElementById('camGain');
+          if (el) el.value = state.camGain;
+          camLabelDirty = true;
+        }
+        if (s.cam_night !== undefined && Boolean(s.cam_night) !== state.camNight) {
+          state.camNight = Boolean(s.cam_night);
+          const el = document.getElementById('camNight');
+          if (el) el.checked = state.camNight;
+        }
+        if (camLabelDirty) updateLabels();
+      }
       if (!recentlyControlled && (performance.now() - state.lastConfigSentAt > 1200)) {
         if (state.autoAim !== Boolean(s.auto_aim)) {
           state.autoAim = Boolean(s.auto_aim);
@@ -1815,7 +2001,6 @@ function applyStatus(s) {
         y: s.servo_y,
         led: s.manual_led,
         laser: s.manual_laser,
-        res: s.resolution,
       });
     }
 
@@ -1913,6 +2098,28 @@ function onKeyDown(e) {
   }
 }
 
+/* ================= UNLOAD FAIL-SAFE (LASER/FLASH OFF ON TAB CLOSE) ================= */
+function sendUnloadFailsafe() {
+  if (!getEffectiveManualLaser() && !getEffectiveManualLed()) {
+    return;
+  }
+  releaseAllMomentaryInputs();
+  state.latchLaser = false;
+  state.latchLed = false;
+  const payload = JSON.stringify({ action: 'failsafe' });
+  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+    try {
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon('/api/action', blob)) {
+        return;
+      }
+    } catch (_err) {}
+  }
+  try {
+    fetch('/servo?laser=0&led=0', { method: 'GET', keepalive: true, cache: 'no-store' });
+  } catch (_err) {}
+}
+
 /* ================= BOOTSTRAP ================= */
 document.addEventListener('DOMContentLoaded', () => {
   initGimbalPad();
@@ -1956,6 +2163,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('mouseup', onPointerLockMouseUp);
   document.addEventListener('keydown', onKeyDown);
   window.addEventListener('blur', releaseAllMomentaryInputs);
+  window.addEventListener('pagehide', sendUnloadFailsafe);
+  window.addEventListener('beforeunload', sendUnloadFailsafe);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       stopStatusPolling();

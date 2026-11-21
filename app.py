@@ -21,9 +21,10 @@ WSGIRequestHandler.protocol_version = "HTTP/1.1"
 
 
 class QuietStatusRequestHandler(WSGIRequestHandler):
-    """HTTP/1.1 WSGI request handler that suppresses routine 200/204 access logs for high-frequency routes."""
+    """HTTP/1.1 WSGI request handler with TCP_NODELAY that suppresses routine 200/204 access logs."""
 
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
     _QUIET_PATHS = ("/api/status", "/servo")
 
     def log_request(self, code="-", size="-"):
@@ -56,14 +57,13 @@ def index():
 
 @app.route("/servo", methods=["GET", "OPTIONS"])
 def servo_control():
-    """Unified control route mirroring ESP32-CAM GET /servo on port 80.
+    """Real-time actuator control route mirroring ESP32-CAM GET /servo on port 80.
 
-    Accepted optional & combinable query parameters:
-      x=0..180     -> Servo 1 angle (IO14, X-axis)
-      y=0..180     -> Servo 2 angle (IO13, Y-axis)
-      led=0|1      -> Flash LED (IO4)
-      laser=0|1    -> Green Laser (IO15)
-      res=0..5     -> Camera resolution (0=QVGA..5=UXGA)
+    Accepted optional & combinable query parameters (<= 95 chars):
+      x=0..180     -> Servo 1 angle (GPIO 14, X-axis, immediate PWM, 500 ms Auto-Detach)
+      y=0..180     -> Servo 2 angle (GPIO 13, Y-axis, immediate PWM, 500 ms Auto-Detach)
+      laser=0|1    -> Green Laser (GPIO 15)
+      led=0|1      -> Flash LED (GPIO 4)
     """
     if request.method == "OPTIONS":
         return Response("", status=204)
@@ -89,6 +89,40 @@ def servo_control():
         except ValueError:
             return raw.lower() in ("true", "on")
 
+    x = _parse_float("x")
+    y = _parse_float("y")
+    led = _parse_bool_int("led")
+    laser = _parse_bool_int("laser")
+
+    engine.apply_servo_command(
+        x=x,
+        y=y,
+        led=led,
+        laser=laser,
+        disable_auto_aim=(x is not None or y is not None),
+    )
+    resp = Response("OK", status=200, mimetype="text/plain")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/cam", methods=["GET", "OPTIONS"])
+def cam_control():
+    """Camera settings route mirroring ESP32-CAM GET /cam on port 80 (OV3660).
+
+    Accepted optional & combinable query parameters (<= 95 chars):
+      res=0..3     -> Resolution (0=QVGA, 1=CIF, 2=VGA, 3=SVGA max)
+      bri=-3..3    -> Brightness (default 1)
+      ae=-5..5     -> Auto-exposure level (default 3)
+      gain=0..5    -> OV3660 gainceiling (0=2x..5=64x, default 5)
+      night=0|1    -> Night mode / aec2 (default 1)
+    """
+    if request.method == "OPTIONS":
+        return Response("", status=204)
+
+    if engine is None:
+        return Response("ENGINE NOT READY", status=503, mimetype="text/plain")
+
     def _parse_int(key: str) -> Optional[int]:
         raw = request.args.get(key)
         if raw is None or raw == "":
@@ -98,19 +132,28 @@ def servo_control():
         except ValueError:
             return None
 
-    x = _parse_float("x")
-    y = _parse_float("y")
-    led = _parse_bool_int("led")
-    laser = _parse_bool_int("laser")
-    res = _parse_int("res")
+    def _parse_bool_int(key: str) -> Optional[bool]:
+        raw = request.args.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw) != 0
+        except ValueError:
+            return raw.lower() in ("true", "on")
 
-    engine.apply_servo_command(
-        x=x,
-        y=y,
-        led=led,
-        laser=laser,
+    res = _parse_int("res")
+    bri = _parse_int("bri")
+    ae = _parse_int("ae")
+    gain = _parse_int("gain")
+    night = _parse_bool_int("night")
+
+    engine.apply_cam_command(
         res=res,
-        disable_auto_aim=(x is not None or y is not None),
+        bri=bri,
+        ae=ae,
+        gain=gain,
+        night=night,
+        force=True,
     )
     resp = Response("OK", status=200, mimetype="text/plain")
     resp.headers["Cache-Control"] = "no-store"
@@ -192,6 +235,19 @@ def api_action():
     elif action == "set_resolution":
         res_code = int(data.get("res", 3))
         engine.set_resolution(res_code)
+    elif action == "set_cam":
+        engine.apply_cam_command(
+            res=int(data["res"]) if data.get("res") is not None else None,
+            bri=int(data["bri"]) if data.get("bri") is not None else None,
+            ae=int(data["ae"]) if data.get("ae") is not None else None,
+            gain=int(data["gain"]) if data.get("gain") is not None else None,
+            night=bool(data["night"]) if data.get("night") is not None else None,
+            force=True,
+        )
+    elif action == "reset_cam":
+        engine.reset_cam_defaults()
+    elif action in ("failsafe", "all_off"):
+        engine.failsafe_off()
     elif action == "discord_test":
         ok, msg = engine.send_discord_test()
         return jsonify({"ok": ok, "message": msg, "status": engine.get_status()}), (200 if ok else 400)
@@ -231,9 +287,14 @@ def main() -> None:
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_handler)
 
     engine.start()
-    print(f"[AutoAIM] Conectando ao stream {args.stream_url} e controlando {args.turret_url}/servo")
+    print(
+        f"[AutoAIM] Stream: {args.stream_url} | Controle HTTP: {args.turret_url}/servo | "
+        f"Câmera: {args.turret_url}/cam"
+    )
     print(f"[AutoAIM] Dashboard Web disponível em http://localhost:{args.port}/")
 
     if args.show_window:

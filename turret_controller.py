@@ -1,9 +1,12 @@
+import http.client
 import json
 import math
 import os
 import queue
+import socket
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -59,7 +62,8 @@ DEFAULT_TURRET_URL = os.environ.get("TURRET_URL", "http://192.168.100.5")
 DEFAULT_STREAM_URL = os.environ.get("STREAM_URL", "http://192.168.100.5:81/stream")
 DEFAULT_BACKEND = os.environ.get("AUTOAIM_BACKEND", "auto").lower()
 DEFAULT_CPU_THREADS = max(1, int(os.environ.get("AUTOAIM_CPU_THREADS", "4")))
-DEFAULT_MAX_FPS = float(os.environ.get("AUTOAIM_MAX_FPS", "20.0"))
+DEFAULT_MAX_FPS = float(os.environ.get("AUTOAIM_MAX_FPS", "30.0"))
+DEFAULT_CAMERA_LATENCY = max(0.0, min(0.5, float(os.environ.get("AUTOAIM_CAMERA_LATENCY", "0.15"))))
 DEFAULT_DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 DEFAULT_DISCORD_COOLDOWN_S = max(5.0, float(os.environ.get("DISCORD_COOLDOWN_S", "30.0")))
 DEFAULT_DISCORD_ABSENCE_RESET_S = max(3.0, float(os.environ.get("DISCORD_ABSENCE_RESET_S", "15.0")))
@@ -92,9 +96,22 @@ RESOLUTION_OPTIONS = {
     1: ("CIF", 400, 296),
     2: ("VGA", 640, 480),
     3: ("SVGA", 800, 600),
-    4: ("XGA", 1024, 768),
-    5: ("UXGA", 1600, 1200),
 }
+
+CAM_GAIN_OPTIONS = {
+    0: "2x",
+    1: "4x",
+    2: "8x",
+    3: "16x",
+    4: "32x",
+    5: "64x",
+}
+
+DEFAULT_CAM_RES = 3
+DEFAULT_CAM_BRI = 1
+DEFAULT_CAM_AE = 3
+DEFAULT_CAM_GAIN = 5
+DEFAULT_CAM_NIGHT = True
 
 
 def infer_resolution_code(width: int, height: int) -> int:
@@ -127,19 +144,47 @@ class Detection:
         return max(0.0, self.x2 - self.x1) * max(0.0, self.y2 - self.y1)
 
 
+class _TCPNoDelayHTTPAdapter(HTTPAdapter):
+    """Requests HTTPAdapter with TCP_NODELAY (and optional SO_KEEPALIVE) enabled on every socket."""
+
+    def __init__(self, *args, keepalive: bool = True, **kwargs) -> None:
+        self._keepalive = keepalive
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        sock_opts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+        if self._keepalive:
+            sock_opts.append((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1))
+        pool_kwargs["socket_options"] = sock_opts
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
 class MJPEGStreamReader:
-    """Reads frames continuously from an ESP32-CAM MJPEG HTTP stream."""
+    """Low-latency MJPEG reader tuned for ESP32-CAM port 81 chunked HTTP/1.1 streaming.
+
+    - Uses http.client + SO_KEEPALIVE (idle=2s, intvl=1s, cnt=2) + read1() for chunked multipart frames.
+    - Parses multipart boundary + exact Content-Length headers (with SOI/EOI fallback).
+    - Validates JPEG SOI (0xFF 0xD8), drains stale frames, and decodes only the newest frame.
+    - Actively shuts down and closes the socket on stop() and reconnects to free port 81's single client slot immediately.
+    """
+
+    MAX_JPEG_BYTES = 2 * 1024 * 1024
 
     def __init__(self, stream_url: str = DEFAULT_STREAM_URL, rotation: int = 90) -> None:
         self.stream_url = stream_url
         self._rotation = rotation if rotation in ROTATION_CODES else 90
         self._lock = threading.Lock()
+        self._conn_lock = threading.Lock()
+        self._active_conn: Optional[http.client.HTTPConnection] = None
         self._stop_event = threading.Event()
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_id: int = 0
         self._last_frame_time: float = 0.0
         self._connected: bool = False
         self._last_error: str = ""
+        self._stream_fps: float = 0.0
+        self._last_frame_bytes: int = 0
+        self._frames_dropped: int = 0
         self._thread = threading.Thread(target=self._reader_loop, daemon=True, name="MJPEGReader")
 
     def start(self) -> None:
@@ -148,8 +193,29 @@ class MJPEGStreamReader:
             self._thread = threading.Thread(target=self._reader_loop, daemon=True, name="MJPEGReader")
             self._thread.start()
 
+    def _abort_active_conn(self) -> None:
+        with self._conn_lock:
+            conn = self._active_conn
+            self._active_conn = None
+        if conn is not None:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def stop(self) -> None:
         self._stop_event.set()
+        self._abort_active_conn()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
@@ -166,48 +232,199 @@ class MJPEGStreamReader:
         with self._lock:
             return self._connected and (time.time() - self._last_frame_time < 3.0)
 
+    def get_stats(self) -> Dict[str, object]:
+        with self._lock:
+            return {
+                "connected": self._connected and (time.time() - self._last_frame_time < 3.0),
+                "stream_fps": self._stream_fps,
+                "last_frame_bytes": self._last_frame_bytes,
+                "frames_dropped": self._frames_dropped,
+                "last_error": self._last_error,
+            }
+
     def get_latest_frame(self) -> Tuple[Optional[np.ndarray], int, float]:
         with self._lock:
             if self._latest_frame is None:
                 return None, self._frame_id, self._last_frame_time
-            return self._latest_frame.copy(), self._frame_id, self._last_frame_time
+            return self._latest_frame, self._frame_id, self._last_frame_time
+
+    @staticmethod
+    def _extract_boundary(content_type: str) -> Optional[bytes]:
+        for part in (content_type or "").split(";"):
+            part = part.strip()
+            if part.lower().startswith("boundary="):
+                bval = part.split("=", 1)[1].strip().strip('"').strip("'")
+                if bval:
+                    if not bval.startswith("--"):
+                        bval = "--" + bval
+                    return bval.encode("ascii", errors="ignore")
+        return None
+
+    @staticmethod
+    def _parse_content_length(header_bytes: bytes) -> Optional[int]:
+        for raw_line in header_bytes.splitlines():
+            low = raw_line.lower()
+            if low.startswith(b"content-length:"):
+                try:
+                    val = int(raw_line.split(b":", 1)[1].strip())
+                    if 0 < val <= MJPEGStreamReader.MAX_JPEG_BYTES:
+                        return val
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def _drain_frames_from_buffer(
+        cls, buf: bytearray, boundary: Optional[bytes]
+    ) -> Tuple[Optional[bytes], int]:
+        """Extract all complete JPEG frames from buf, returning (newest_jpeg, dropped_count)."""
+        newest_jpg: Optional[bytes] = None
+        dropped = 0
+
+        if boundary is not None:
+            blen = len(boundary)
+            while True:
+                b_idx = buf.find(boundary)
+                if b_idx == -1:
+                    # Wait for boundary unless buffer grew abnormally without one
+                    if len(buf) > cls.MAX_JPEG_BYTES:
+                        del buf[:-blen]
+                    break
+                if b_idx > 0:
+                    del buf[:b_idx]
+
+                hdr_end = buf.find(b"\r\n\r\n", blen)
+                sep_len = 4
+                if hdr_end == -1:
+                    hdr_end = buf.find(b"\n\n", blen)
+                    sep_len = 2
+                if hdr_end == -1:
+                    if len(buf) > 4096:
+                        del buf[:blen]
+                        continue
+                    break
+
+                header_block = bytes(buf[blen:hdr_end])
+                body_start = hdr_end + sep_len
+                clen = cls._parse_content_length(header_block)
+
+                if clen is not None:
+                    body_end = body_start + clen
+                    if len(buf) < body_end:
+                        break
+                    candidate = bytes(buf[body_start:body_end])
+                    del buf[:body_end]
+                    if len(candidate) >= 4 and candidate[0] == 0xFF and candidate[1] == 0xD8:
+                        if newest_jpg is not None:
+                            dropped += 1
+                        newest_jpg = candidate
+                    continue
+
+                # Boundary present but Content-Length omitted: slice until next boundary
+                next_b = buf.find(boundary, body_start)
+                if next_b == -1:
+                    if len(buf) > cls.MAX_JPEG_BYTES:
+                        buf.clear()
+                    break
+                candidate = bytes(buf[body_start:next_b]).strip(b"\r\n")
+                del buf[:next_b]
+                if len(candidate) >= 4 and candidate[0] == 0xFF and candidate[1] == 0xD8:
+                    if newest_jpg is not None:
+                        dropped += 1
+                    newest_jpg = candidate
+            return newest_jpg, dropped
+
+        # Fallback SOI/EOI extraction for streams without multipart boundary
+        while True:
+            start = buf.find(b"\xff\xd8\xff")
+            if start == -1:
+                if len(buf) > 65536:
+                    buf.clear()
+                break
+            if start > 0:
+                del buf[:start]
+            end = buf.find(b"\xff\xd9", 3)
+            if end == -1:
+                if len(buf) > cls.MAX_JPEG_BYTES:
+                    buf.clear()
+                break
+            last_soi = buf.rfind(b"\xff\xd8\xff", 0, end)
+            if last_soi > 0:
+                del buf[:last_soi]
+                end -= last_soi
+            if newest_jpg is not None:
+                dropped += 1
+            newest_jpg = bytes(buf[: end + 2])
+            del buf[: end + 2]
+        return newest_jpg, dropped
 
     def _reader_loop(self) -> None:
+        backoff_s = 0.4
+        prev_frame_mono = 0.0
+        stream_fps_ema = 0.0
+
         while not self._stop_event.is_set():
-            resp = None
+            conn: Optional[http.client.HTTPConnection] = None
             try:
-                resp = requests.get(self.stream_url, stream=True, timeout=(3.0, 5.0))
-                resp.raise_for_status()
-                buf = bytearray()
-                for chunk in resp.iter_content(chunk_size=8192):
+                parsed = urllib.parse.urlparse(self.stream_url)
+                use_tls = parsed.scheme.lower() == "https"
+                host = parsed.hostname
+                if not host:
+                    raise ValueError(f"Invalid stream URL: {self.stream_url}")
+                port = parsed.port or (443 if use_tls else 80)
+                path = parsed.path or "/stream"
+                if parsed.query:
+                    path = f"{path}?{parsed.query}"
+
+                if use_tls:
+                    conn = http.client.HTTPSConnection(host, port, timeout=3.5)
+                else:
+                    conn = http.client.HTTPConnection(host, port, timeout=3.5)
+
+                with self._conn_lock:
                     if self._stop_event.is_set():
                         break
+                    self._active_conn = conn
+
+                conn.connect()
+                if conn.sock is not None:
+                    try:
+                        # Match ESP32 port 81 socket profile: SO_KEEPALIVE (idle=2s, intvl=1s, cnt=2), no TCP_NODELAY
+                        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        for opt_name, val in (("TCP_KEEPIDLE", 2), ("TCP_KEEPINTVL", 1), ("TCP_KEEPCNT", 2)):
+                            opt = getattr(socket, opt_name, None)
+                            if opt is not None:
+                                try:
+                                    conn.sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+
+                conn.request(
+                    "GET",
+                    path,
+                    headers={
+                        "Connection": "close",
+                        "Cache-Control": "no-cache",
+                        "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
+                    },
+                )
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    raise ConnectionError(f"Stream HTTP {resp.status} {resp.reason}")
+
+                boundary = self._extract_boundary(resp.getheader("Content-Type", ""))
+                buf = bytearray()
+                backoff_s = 0.4
+
+                while not self._stop_event.is_set():
+                    chunk = resp.read1(16384)
                     if not chunk:
-                        continue
+                        break
                     buf.extend(chunk)
 
-                    # Drain all complete JPEGs in the buffer and keep only the newest one
-                    newest_jpg = None
-                    while True:
-                        start = buf.find(b"\xff\xd8\xff")
-                        if start == -1:
-                            if len(buf) > 65536:
-                                buf.clear()
-                            break
-                        if start > 0:
-                            del buf[:start]
-                        end = buf.find(b"\xff\xd9", 3)
-                        if end == -1:
-                            if len(buf) > 1048576:
-                                buf.clear()
-                            break
-                        last_soi = buf.rfind(b"\xff\xd8\xff", 0, end)
-                        if last_soi > 0:
-                            del buf[:last_soi]
-                            end -= last_soi
-                        newest_jpg = bytes(buf[: end + 2])
-                        del buf[: end + 2]
-
+                    newest_jpg, dropped = self._drain_frames_from_buffer(buf, boundary)
                     if newest_jpg is not None:
                         arr = np.frombuffer(newest_jpg, dtype=np.uint8)
                         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -216,76 +433,140 @@ class MJPEGStreamReader:
                                 rot_code = ROTATION_CODES.get(self._rotation)
                             if rot_code is not None:
                                 frame = cv2.rotate(frame, rot_code)
+                            now_wall = time.time()
+                            now_mono = time.monotonic()
+                            if prev_frame_mono > 0.0:
+                                dt = max(1e-3, now_mono - prev_frame_mono)
+                                inst_fps = 1.0 / dt
+                                alpha = 1.0 - math.exp(-dt / 0.8)
+                                stream_fps_ema = (
+                                    inst_fps
+                                    if stream_fps_ema == 0.0
+                                    else ((1.0 - alpha) * stream_fps_ema + alpha * inst_fps)
+                                )
+                            prev_frame_mono = now_mono
                             with self._lock:
                                 self._latest_frame = frame
                                 self._frame_id += 1
-                                self._last_frame_time = time.time()
+                                self._last_frame_time = now_wall
                                 self._connected = True
                                 self._last_error = ""
+                                self._stream_fps = stream_fps_ema
+                                self._last_frame_bytes = len(newest_jpg)
+                                self._frames_dropped += dropped
             except Exception as exc:
                 with self._lock:
                     self._connected = False
                     self._last_error = str(exc)
             finally:
-                if resp is not None:
+                with self._conn_lock:
+                    if self._active_conn is conn:
+                        self._active_conn = None
+                if conn is not None:
+                    # Explicitly shut down socket to immediately release ESP32 port 81 single-client slot
+                    sock = getattr(conn, "sock", None)
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except Exception:
+                            pass
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
                     try:
-                        resp.close()
+                        conn.close()
                     except Exception:
                         pass
             if not self._stop_event.is_set():
-                time.sleep(1.0)
+                self._stop_event.wait(timeout=backoff_s)
+                backoff_s = min(1.5, backoff_s * 1.4)
 
 
 class TurretHardwareClient:
-    """Single-flight non-blocking HTTP client for unified ESP32-CAM GET /servo control.
+    """Single-flight HTTP client for ESP32-CAM port 80 (GET /servo + GET /cam).
 
-    Sends x, y, led, laser (and optional res when changed) together in a single
-    keep-alive request, dispatching only when state changes:
-      - 0 ms immediate priority when led, laser, or res changes
-      - 30 ms minimum interval when only x/y changes
+    - Reuses a persistent keep-alive TCP connection with TCP_NODELAY on port 80 and <= 95-char query guard.
+    - Endpoint separation matching ESP32 firmware:
+        * GET /servo -> real-time actuators only (x=0..180, y=0..180, led=0|1, laser=0|1).
+          Servos apply immediately (no ramp) with 500 ms PWM Auto-Detach on ESP32; sends minimal
+          delta queries ("laser=1", "led=0") when servos are parked so Auto-Detach stays undisturbed.
+          0 ms immediate priority for laser/led; 30 ms interval for servo motion.
+        * GET /cam -> camera settings (res=0..3, bri=-3..3, ae=-5..5, gain=0..5, night=0|1),
+          dispatched with 0 ms priority without waking servos.
+    - Safety fail-safe:
+        * Always transmits GET /servo?laser=0&led=0 on shutdown() and supports runtime
+          force_failsafe() so laser/flash never stay stuck ON.
     """
 
-    MOVE_MIN_INTERVAL_S = 0.030
+    HTTP_MAX_QUERY_CHARS = 95
+    HTTP_MOVE_MIN_INTERVAL_S = 0.030
 
-    def __init__(self, base_url: str = DEFAULT_TURRET_URL, move_min_interval: float = MOVE_MIN_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        base_url: str = DEFAULT_TURRET_URL,
+        move_min_interval: Optional[float] = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.move_min_interval = max(0.0, float(move_min_interval))
+        self._move_min_interval: float = (
+            max(0.0, float(move_min_interval))
+            if move_min_interval is not None
+            else self.HTTP_MOVE_MIN_INTERVAL_S
+        )
+
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wakeup_event = threading.Event()
 
         self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=2)
+        adapter = _TCPNoDelayHTTPAdapter(pool_connections=1, pool_maxsize=2, keepalive=True)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
         self._session.headers.update({"Connection": "keep-alive"})
 
+        # Real-time /servo targets & last-sent values
         self._target_x: int = 90
         self._target_y: int = 90
         self._target_led: bool = False
         self._target_laser: bool = False
-        self._target_res: Optional[int] = None
 
         self._sent_x: Optional[int] = None
         self._sent_y: Optional[int] = None
         self._sent_led: Optional[bool] = None
         self._sent_laser: Optional[bool] = None
-        self._sent_res: Optional[int] = None
+
+        # Eventual /cam targets & last-sent values
+        self._target_cam_res: Optional[int] = None
+        self._target_cam_bri: Optional[int] = None
+        self._target_cam_ae: Optional[int] = None
+        self._target_cam_gain: Optional[int] = None
+        self._target_cam_night: Optional[bool] = None
+
+        self._sent_cam_res: Optional[int] = None
+        self._sent_cam_bri: Optional[int] = None
+        self._sent_cam_ae: Optional[int] = None
+        self._sent_cam_gain: Optional[int] = None
+        self._sent_cam_night: Optional[bool] = None
 
         self._last_send_monotonic: float = 0.0
         self._last_rtt_ms: float = 0.0
         self._last_error: str = ""
         self._last_url: str = ""
+        self._last_payload: str = ""
+        self._last_cam_payload: str = ""
         self._pose_history: List[Tuple[float, int, int]] = [(time.time(), 90, 90)]
 
-        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretHTTP")
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretControl")
 
     def start(self) -> None:
         if not self._thread.is_alive():
             self._stop_event.clear()
             self._wakeup_event.clear()
-            self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretHTTP")
+            self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="TurretControl")
             self._thread.start()
+
+    def get_effective_move_interval(self) -> float:
+        return self._move_min_interval
 
     def set_state(
         self,
@@ -293,7 +574,6 @@ class TurretHardwareClient:
         y: Optional[float] = None,
         led: Optional[bool] = None,
         laser: Optional[bool] = None,
-        res: Optional[int] = None,
     ) -> None:
         changed = False
         with self._lock:
@@ -317,10 +597,54 @@ class TurretHardwareClient:
                 if blaser != self._target_laser or blaser != self._sent_laser:
                     self._target_laser = blaser
                     changed = True
+        if changed:
+            self._wakeup_event.set()
+
+    def set_cam_settings(
+        self,
+        res: Optional[int] = None,
+        bri: Optional[int] = None,
+        ae: Optional[int] = None,
+        gain: Optional[int] = None,
+        night: Optional[bool] = None,
+        force: bool = False,
+    ) -> None:
+        changed = False
+        with self._lock:
             if res is not None:
-                ires = max(0, min(5, int(res)))
-                if ires != self._target_res or ires != self._sent_res:
-                    self._target_res = ires
+                ires = max(0, min(3, int(res)))
+                if force or ires != self._target_cam_res or ires != self._sent_cam_res:
+                    self._target_cam_res = ires
+                    if force:
+                        self._sent_cam_res = None
+                    changed = True
+            if bri is not None:
+                ibri = max(-3, min(3, int(bri)))
+                if force or ibri != self._target_cam_bri or ibri != self._sent_cam_bri:
+                    self._target_cam_bri = ibri
+                    if force:
+                        self._sent_cam_bri = None
+                    changed = True
+            if ae is not None:
+                iae = max(-5, min(5, int(ae)))
+                if force or iae != self._target_cam_ae or iae != self._sent_cam_ae:
+                    self._target_cam_ae = iae
+                    if force:
+                        self._sent_cam_ae = None
+                    changed = True
+            if gain is not None:
+                igain = max(0, min(5, int(gain)))
+                if force or igain != self._target_cam_gain or igain != self._sent_cam_gain:
+                    self._target_cam_gain = igain
+                    if force:
+                        self._sent_cam_gain = None
+                    changed = True
+            if night is not None:
+                bnight = bool(night)
+                if force or bnight != self._target_cam_night or bnight != self._sent_cam_night:
+                    self._target_cam_night = bnight
+                    if force:
+                        self._sent_cam_night = None
                     changed = True
         if changed:
             self._wakeup_event.set()
@@ -335,10 +659,24 @@ class TurretHardwareClient:
         self.set_state(laser=state)
 
     def center(self) -> None:
-        self.set_state(x=90, y=90)
+        with self._lock:
+            self._target_x = 90
+            self._target_y = 90
+            self._sent_x = None
+            self._sent_y = None
+        self._wakeup_event.set()
 
-    def set_resolution(self, res_code: int) -> None:
-        self.set_state(res=res_code)
+    def force_failsafe(self) -> None:
+        """Force immediate transmission of laser=0&led=0 regardless of cached sent state."""
+        with self._lock:
+            self._target_led = False
+            self._target_laser = False
+            self._sent_led = None
+            self._sent_laser = None
+        self._wakeup_event.set()
+
+    def set_resolution(self, res_code: int, force: bool = False) -> None:
+        self.set_cam_settings(res=res_code, force=force)
 
     def get_pose_at(self, timestamp: float) -> Tuple[float, float]:
         with self._lock:
@@ -352,20 +690,24 @@ class TurretHardwareClient:
 
     def get_state(self) -> Dict[str, object]:
         with self._lock:
+            move_ms = int(round(self._move_min_interval * 1000.0))
             return {
                 "target_x": self._target_x,
                 "target_y": self._target_y,
                 "target_led": self._target_led,
                 "target_laser": self._target_laser,
-                "target_res": self._target_res,
+                "target_res": self._target_cam_res,
                 "sent_x": self._sent_x,
                 "sent_y": self._sent_y,
                 "sent_led": self._sent_led,
                 "sent_laser": self._sent_laser,
-                "sent_res": self._sent_res,
+                "sent_res": self._sent_cam_res,
+                "move_interval_ms": move_ms,
                 "last_rtt_ms": round(self._last_rtt_ms, 1),
                 "last_error": self._last_error,
                 "last_url": self._last_url,
+                "last_payload": self._last_payload,
+                "last_cam_payload": self._last_cam_payload,
             }
 
     def shutdown(self) -> None:
@@ -373,11 +715,11 @@ class TurretHardwareClient:
         self._wakeup_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=1.5)
+        # Guaranteed HTTP confirmation so laser/flash NEVER remain stuck ON
         try:
             self._session.get(
-                f"{self.base_url}/servo",
-                params={"led": 0, "laser": 0},
-                timeout=0.8,
+                f"{self.base_url}/servo?laser=0&led=0",
+                timeout=(0.8, 1.0),
             )
         except Exception:
             pass
@@ -386,86 +728,328 @@ class TurretHardwareClient:
         except Exception:
             pass
 
+    @classmethod
+    def _build_servo_query(
+        cls,
+        tx: int,
+        ty: int,
+        tled: bool,
+        tlaser: bool,
+        sx: Optional[int],
+        sy: Optional[int],
+        sled: Optional[bool],
+        slaser: Optional[bool],
+    ) -> Tuple[str, bool, bool, bool]:
+        """Build optimal HTTP GET /servo query string (strictly <= 95 chars; x, y, led, laser only)."""
+        led_i = 1 if tled else 0
+        laser_i = 1 if tlaser else 0
+        angles_dirty = (sx is None) or (sy is None) or (tx != sx) or (ty != sy)
+        led_dirty = (sled is None) or (tled != sled)
+        laser_dirty = (slaser is None) or (tlaser != slaser)
+
+        parts: List[str] = []
+        sent_angles = False
+        sent_led = False
+        sent_laser = False
+
+        if angles_dirty:
+            parts.extend((f"x={tx}", f"y={ty}", f"laser={laser_i}", f"led={led_i}"))
+            sent_angles = True
+            sent_led = True
+            sent_laser = True
+        else:
+            if laser_dirty:
+                parts.append(f"laser={laser_i}")
+                sent_laser = True
+            if led_dirty:
+                parts.append(f"led={led_i}")
+                sent_led = True
+
+        if not parts:
+            parts.extend((f"x={tx}", f"y={ty}", f"laser={laser_i}", f"led={led_i}"))
+            sent_angles = True
+            sent_led = True
+            sent_laser = True
+
+        query = "&".join(parts)
+        if len(query) > cls.HTTP_MAX_QUERY_CHARS:
+            raise ValueError(f"HTTP /servo query exceeds {cls.HTTP_MAX_QUERY_CHARS} chars: {query}")
+        return query, sent_angles, sent_led, sent_laser
+
+    @classmethod
+    def _build_cam_query(
+        cls,
+        tres: Optional[int],
+        tbri: Optional[int],
+        tae: Optional[int],
+        tgain: Optional[int],
+        tnight: Optional[bool],
+        sres: Optional[int],
+        sbri: Optional[int],
+        sae: Optional[int],
+        sgain: Optional[int],
+        snight: Optional[bool],
+    ) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int], Optional[bool]]:
+        """Build optimal HTTP GET /cam query string (strictly <= 95 chars)."""
+        parts: List[str] = []
+        out_res: Optional[int] = None
+        out_bri: Optional[int] = None
+        out_ae: Optional[int] = None
+        out_gain: Optional[int] = None
+        out_night: Optional[bool] = None
+
+        if tres is not None and tres != sres:
+            parts.append(f"res={tres}")
+            out_res = tres
+        if tbri is not None and tbri != sbri:
+            parts.append(f"bri={tbri}")
+            out_bri = tbri
+        if tae is not None and tae != sae:
+            parts.append(f"ae={tae}")
+            out_ae = tae
+        if tgain is not None and tgain != sgain:
+            parts.append(f"gain={tgain}")
+            out_gain = tgain
+        if tnight is not None and tnight != snight:
+            parts.append(f"night={1 if tnight else 0}")
+            out_night = tnight
+
+        query = "&".join(parts)
+        if len(query) > cls.HTTP_MAX_QUERY_CHARS:
+            raise ValueError(f"HTTP /cam query exceeds {cls.HTTP_MAX_QUERY_CHARS} chars: {query}")
+        return query, out_res, out_bri, out_ae, out_gain, out_night
+
+    def _record_servo_sent(
+        self,
+        tx: int,
+        ty: int,
+        tled: bool,
+        tlaser: bool,
+        sent_angles: bool,
+        sent_led: bool,
+        sent_laser: bool,
+        rtt_ms: float,
+        last_url: str,
+        last_payload: str,
+    ) -> None:
+        with self._lock:
+            if sent_angles:
+                self._sent_x = tx
+                self._sent_y = ty
+                self._pose_history.append((time.time(), tx, ty))
+                if len(self._pose_history) > 60:
+                    del self._pose_history[:-60]
+            if sent_led:
+                self._sent_led = tled
+            if sent_laser:
+                self._sent_laser = tlaser
+            self._last_rtt_ms = rtt_ms
+            self._last_error = ""
+            self._last_url = last_url
+            self._last_payload = last_payload
+
+    def _record_cam_sent(
+        self,
+        sent_res: Optional[int],
+        sent_bri: Optional[int],
+        sent_ae: Optional[int],
+        sent_gain: Optional[int],
+        sent_night: Optional[bool],
+        rtt_ms: float,
+        last_url: str,
+        last_payload: str,
+    ) -> None:
+        with self._lock:
+            if sent_res is not None:
+                self._sent_cam_res = sent_res
+            if sent_bri is not None:
+                self._sent_cam_bri = sent_bri
+            if sent_ae is not None:
+                self._sent_cam_ae = sent_ae
+            if sent_gain is not None:
+                self._sent_cam_gain = sent_gain
+            if sent_night is not None:
+                self._sent_cam_night = sent_night
+            self._last_rtt_ms = rtt_ms
+            self._last_error = ""
+            self._last_url = last_url
+            self._last_payload = last_payload
+            self._last_cam_payload = last_payload
+
+    def _dispatch_servo(
+        self,
+        tx: int,
+        ty: int,
+        tled: bool,
+        tlaser: bool,
+        sx: Optional[int],
+        sy: Optional[int],
+        sled: Optional[bool],
+        slaser: Optional[bool],
+    ) -> bool:
+        query, s_ang, s_led, s_las = self._build_servo_query(
+            tx, ty, tled, tlaser, sx, sy, sled, slaser
+        )
+        full_url = f"{self.base_url}/servo?{query}"
+        t0 = time.monotonic()
+        try:
+            r = self._session.get(full_url, timeout=(1.0, 2.5))
+            rtt_ms = (time.monotonic() - t0) * 1000.0
+            self._last_send_monotonic = time.monotonic()
+            if r.status_code == 200:
+                self._record_servo_sent(
+                    tx=tx,
+                    ty=ty,
+                    tled=tled,
+                    tlaser=tlaser,
+                    sent_angles=s_ang,
+                    sent_led=s_led,
+                    sent_laser=s_las,
+                    rtt_ms=rtt_ms,
+                    last_url=full_url,
+                    last_payload=f"GET /servo?{query}",
+                )
+                return True
+            with self._lock:
+                self._last_error = f"HTTP /servo {r.status_code}"
+            self._stop_event.wait(timeout=0.15)
+            return False
+        except Exception as exc:
+            self._last_send_monotonic = time.monotonic()
+            with self._lock:
+                self._last_error = str(exc)
+            self._stop_event.wait(timeout=0.25)
+            return False
+
+    def _dispatch_cam(
+        self,
+        tres: Optional[int],
+        tbri: Optional[int],
+        tae: Optional[int],
+        tgain: Optional[int],
+        tnight: Optional[bool],
+        sres: Optional[int],
+        sbri: Optional[int],
+        sae: Optional[int],
+        sgain: Optional[int],
+        snight: Optional[bool],
+    ) -> bool:
+        query, o_res, o_bri, o_ae, o_gain, o_night = self._build_cam_query(
+            tres, tbri, tae, tgain, tnight, sres, sbri, sae, sgain, snight
+        )
+        if not query:
+            return True
+        full_url = f"{self.base_url}/cam?{query}"
+        t0 = time.monotonic()
+        try:
+            r = self._session.get(full_url, timeout=(1.0, 3.0))
+            rtt_ms = (time.monotonic() - t0) * 1000.0
+            if r.status_code == 200:
+                self._record_cam_sent(
+                    sent_res=o_res,
+                    sent_bri=o_bri,
+                    sent_ae=o_ae,
+                    sent_gain=o_gain,
+                    sent_night=o_night,
+                    rtt_ms=rtt_ms,
+                    last_url=full_url,
+                    last_payload=f"GET /cam?{query}",
+                )
+                return True
+            with self._lock:
+                self._last_error = f"HTTP /cam {r.status_code}"
+            self._stop_event.wait(timeout=0.15)
+            return False
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            self._stop_event.wait(timeout=0.25)
+            return False
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             with self._lock:
                 tx, ty = self._target_x, self._target_y
                 tled, tlaser = self._target_led, self._target_laser
-                tres = self._target_res
                 sx, sy = self._sent_x, self._sent_y
                 sled, slaser = self._sent_led, self._sent_laser
-                sres = self._sent_res
+                tres, tbri, tae, tgain, tnight = (
+                    self._target_cam_res,
+                    self._target_cam_bri,
+                    self._target_cam_ae,
+                    self._target_cam_gain,
+                    self._target_cam_night,
+                )
+                sres, sbri, sae, sgain, snight = (
+                    self._sent_cam_res,
+                    self._sent_cam_bri,
+                    self._sent_cam_ae,
+                    self._sent_cam_gain,
+                    self._sent_cam_night,
+                )
 
-            priority_dirty = (
-                (tled != sled)
-                or (tlaser != slaser)
-                or (tres is not None and tres != sres)
+            servo_priority_dirty = (tled != sled) or (tlaser != slaser)
+            cam_dirty = (
+                (tres is not None and tres != sres)
+                or (tbri is not None and tbri != sbri)
+                or (tae is not None and tae != sae)
+                or (tgain is not None and tgain != sgain)
+                or (tnight is not None and tnight != snight)
             )
-            move_dirty = (tx != sx) or (ty != sy)
+            servo_move_dirty = (tx != sx) or (ty != sy)
 
-            if not priority_dirty and not move_dirty:
+            if not servo_priority_dirty and not cam_dirty and not servo_move_dirty:
                 self._wakeup_event.wait(timeout=0.5)
                 self._wakeup_event.clear()
                 continue
 
-            if not priority_dirty and self.move_min_interval > 0.0:
+            # 1) Immediate 0 ms priority for laser/led safety & responsiveness
+            if servo_priority_dirty:
+                with self._lock:
+                    tx, ty = self._target_x, self._target_y
+                    tled, tlaser = self._target_led, self._target_laser
+                    sx, sy = self._sent_x, self._sent_y
+                    sled, slaser = self._sent_led, self._sent_laser
+                self._dispatch_servo(tx, ty, tled, tlaser, sx, sy, sled, slaser)
+                continue
+
+            # 2) Immediate 0 ms priority for /cam adjustments (independent of /servo)
+            if cam_dirty:
+                with self._lock:
+                    tres, tbri, tae, tgain, tnight = (
+                        self._target_cam_res,
+                        self._target_cam_bri,
+                        self._target_cam_ae,
+                        self._target_cam_gain,
+                        self._target_cam_night,
+                    )
+                    sres, sbri, sae, sgain, snight = (
+                        self._sent_cam_res,
+                        self._sent_cam_bri,
+                        self._sent_cam_ae,
+                        self._sent_cam_gain,
+                        self._sent_cam_night,
+                    )
+                self._dispatch_cam(tres, tbri, tae, tgain, tnight, sres, sbri, sae, sgain, snight)
+                continue
+
+            # 3) Throttled servo Pan/Tilt motion (30 ms min interval)
+            move_interval = self.get_effective_move_interval()
+            if move_interval > 0.0:
                 elapsed = time.monotonic() - self._last_send_monotonic
-                remaining = self.move_min_interval - elapsed
+                remaining = move_interval - elapsed
                 if remaining > 0.0:
                     self._wakeup_event.wait(timeout=remaining)
                     self._wakeup_event.clear()
                     continue
 
-            # Snapshot freshest desired state right before single-flight dispatch
             with self._lock:
                 tx, ty = self._target_x, self._target_y
                 tled, tlaser = self._target_led, self._target_laser
-                tres = self._target_res
-                sres = self._sent_res
+                sx, sy = self._sent_x, self._sent_y
+                sled, slaser = self._sent_led, self._sent_laser
 
-            params: Dict[str, int] = {
-                "x": tx,
-                "y": ty,
-                "led": 1 if tled else 0,
-                "laser": 1 if tlaser else 0,
-            }
-            sending_res: Optional[int] = None
-            if tres is not None and tres != sres:
-                params["res"] = tres
-                sending_res = tres
-
-            t0 = time.monotonic()
-            try:
-                r = self._session.get(
-                    f"{self.base_url}/servo",
-                    params=params,
-                    timeout=0.8,
-                )
-                rtt_ms = (time.monotonic() - t0) * 1000.0
-                self._last_send_monotonic = time.monotonic()
-                if r.status_code == 200:
-                    with self._lock:
-                        self._sent_x = tx
-                        self._sent_y = ty
-                        self._sent_led = tled
-                        self._sent_laser = tlaser
-                        if sending_res is not None:
-                            self._sent_res = sending_res
-                        self._last_rtt_ms = rtt_ms
-                        self._last_error = ""
-                        self._last_url = r.url
-                        self._pose_history.append((time.time(), tx, ty))
-                        if len(self._pose_history) > 60:
-                            del self._pose_history[:-60]
-                else:
-                    with self._lock:
-                        self._last_error = f"HTTP {r.status_code}"
-                    self._stop_event.wait(timeout=0.15)
-            except Exception as exc:
-                self._last_send_monotonic = time.monotonic()
-                with self._lock:
-                    self._last_error = str(exc)
-                self._stop_event.wait(timeout=0.25)
+            self._dispatch_servo(tx, ty, tled, tlaser, sx, sy, sled, slaser)
 
 
 class PersonDetector:
@@ -1394,11 +1978,15 @@ class AutoAimEngine:
         self.conf_threshold: float = 0.28
         self.invert_x: bool = False
         self.invert_y: bool = False
-        self.resolution: int = 3  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA, 4=XGA, 5=UXGA
+        self.resolution: int = DEFAULT_CAM_RES  # 0=QVGA, 1=CIF, 2=VGA, 3=SVGA (max)
+        self.cam_bri: int = DEFAULT_CAM_BRI  # -3..3
+        self.cam_ae: int = DEFAULT_CAM_AE  # -5..5
+        self.cam_gain: int = DEFAULT_CAM_GAIN  # 0..5 (2x..64x)
+        self.cam_night: bool = DEFAULT_CAM_NIGHT  # 0|1 (aec2)
         self._res_explicit: bool = False
         self.max_step_deg: float = 45.0
         self.min_servo_interval: float = 0.03
-        self.camera_latency: float = 0.17
+        self.camera_latency: float = DEFAULT_CAMERA_LATENCY
         self.hold_timeout: float = 0.45
 
         # Internal servo, actuator & tracking state
@@ -1443,8 +2031,8 @@ class AutoAimEngine:
         self._annotated_id: int = 0
         self._frame_cond = threading.Condition()
 
-    def _sync_hardware_locked(self, res: Optional[int] = None) -> None:
-        """Compute effective Flash LED & Green Laser states and push unified state to hardware."""
+    def _sync_hardware_locked(self) -> None:
+        """Compute effective Flash LED & Green Laser states and push unified /servo state to hardware."""
         fire_allowed = self.auto_aim and self.auto_fire and (self.led_mode != "off")
         auto_firing = fire_allowed and self._auto_fire_active
         effective_led = self._manual_led or (auto_firing and self.auto_fire_led) or self._eco_flash_active
@@ -1456,7 +2044,6 @@ class AutoAimEngine:
             y=self._curr_y,
             led=effective_led,
             laser=effective_laser,
-            res=res,
         )
 
     def start(self) -> None:
@@ -1498,7 +2085,12 @@ class AutoAimEngine:
 
     def update_config(self, cfg: Dict[str, object]) -> None:
         with self._lock:
-            hw_res: Optional[int] = None
+            cam_res: Optional[int] = None
+            cam_bri: Optional[int] = None
+            cam_ae: Optional[int] = None
+            cam_gain: Optional[int] = None
+            cam_night: Optional[bool] = None
+            cam_dirty = False
             hw_dirty = False
             now = time.time()
             if "auto_aim" in cfg:
@@ -1625,18 +2217,52 @@ class AutoAimEngine:
                     self._motion_prev_gray = None
                     self._motion_suppress_until = max(self._motion_suppress_until, now + 1.0)
             if "resolution" in cfg and cfg["resolution"] is not None:
-                res_code = max(0, min(5, int(cfg["resolution"])))
-                self.resolution = res_code
-                self._res_explicit = True
-                hw_res = res_code
-                hw_dirty = True
+                res_code = max(0, min(3, int(cfg["resolution"])))
+                if res_code != self.resolution or not self._res_explicit:
+                    self.resolution = res_code
+                    self._res_explicit = True
+                    cam_res = res_code
+                    cam_dirty = True
+            if "cam_bri" in cfg and cfg["cam_bri"] is not None:
+                bri_val = max(-3, min(3, int(cfg["cam_bri"])))
+                if bri_val != self.cam_bri:
+                    self.cam_bri = bri_val
+                    cam_bri = bri_val
+                    cam_dirty = True
+            if "cam_ae" in cfg and cfg["cam_ae"] is not None:
+                ae_val = max(-5, min(5, int(cfg["cam_ae"])))
+                if ae_val != self.cam_ae:
+                    self.cam_ae = ae_val
+                    cam_ae = ae_val
+                    cam_dirty = True
+            if "cam_gain" in cfg and cfg["cam_gain"] is not None:
+                gain_val = max(0, min(5, int(cfg["cam_gain"])))
+                if gain_val != self.cam_gain:
+                    self.cam_gain = gain_val
+                    cam_gain = gain_val
+                    cam_dirty = True
+            if "cam_night" in cfg and cfg["cam_night"] is not None:
+                night_val = bool(cfg["cam_night"])
+                if night_val != self.cam_night:
+                    self.cam_night = night_val
+                    cam_night = night_val
+                    cam_dirty = True
+
+            if cam_dirty:
                 self._motion_prev_gray = None
-                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.5)
+                self.hardware.set_cam_settings(
+                    res=cam_res,
+                    bri=cam_bri,
+                    ae=cam_ae,
+                    gain=cam_gain,
+                    night=cam_night,
+                )
 
             if hw_dirty:
                 self._motion_prev_gray = None
                 self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
-                self._sync_hardware_locked(res=hw_res)
+                self._sync_hardware_locked()
 
         self.discord.update_config(cfg)
 
@@ -1646,10 +2272,9 @@ class AutoAimEngine:
         y: Optional[float] = None,
         led: Optional[bool] = None,
         laser: Optional[bool] = None,
-        res: Optional[int] = None,
         disable_auto_aim: bool = False,
     ) -> None:
-        """Apply unified /servo parameters atomically in a single hardware dispatch."""
+        """Apply real-time /servo parameters atomically in a single hardware dispatch."""
         with self._lock:
             now = time.time()
             if disable_auto_aim and self.auto_aim:
@@ -1684,14 +2309,70 @@ class AutoAimEngine:
                 self._motion_prev_gray = None
             if laser is not None:
                 self._manual_laser = bool(laser)
+            self._sync_hardware_locked()
+
+    def apply_cam_command(
+        self,
+        res: Optional[int] = None,
+        bri: Optional[int] = None,
+        ae: Optional[int] = None,
+        gain: Optional[int] = None,
+        night: Optional[bool] = None,
+        force: bool = True,
+    ) -> None:
+        """Apply camera settings via ESP32 GET /cam (independent from /servo)."""
+        with self._lock:
+            now = time.time()
             res_code: Optional[int] = None
+            bri_val: Optional[int] = None
+            ae_val: Optional[int] = None
+            gain_val: Optional[int] = None
+            night_val: Optional[bool] = None
+            any_set = False
+
             if res is not None:
-                res_code = max(0, min(5, int(res)))
+                res_code = max(0, min(3, int(res)))
                 self.resolution = res_code
                 self._res_explicit = True
-                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
+                any_set = True
+            if bri is not None:
+                bri_val = max(-3, min(3, int(bri)))
+                self.cam_bri = bri_val
+                any_set = True
+            if ae is not None:
+                ae_val = max(-5, min(5, int(ae)))
+                self.cam_ae = ae_val
+                any_set = True
+            if gain is not None:
+                gain_val = max(0, min(5, int(gain)))
+                self.cam_gain = gain_val
+                any_set = True
+            if night is not None:
+                night_val = bool(night)
+                self.cam_night = night_val
+                any_set = True
+
+            if any_set:
+                self._motion_suppress_until = max(self._motion_suppress_until, now + 1.5)
                 self._motion_prev_gray = None
-            self._sync_hardware_locked(res=res_code)
+                self.hardware.set_cam_settings(
+                    res=res_code,
+                    bri=bri_val,
+                    ae=ae_val,
+                    gain=gain_val,
+                    night=night_val,
+                    force=force,
+                )
+
+    def reset_cam_defaults(self) -> None:
+        """Restore ESP32 OV3660 default brightness/exposure/gain/night settings via GET /cam."""
+        self.apply_cam_command(
+            bri=DEFAULT_CAM_BRI,
+            ae=DEFAULT_CAM_AE,
+            gain=DEFAULT_CAM_GAIN,
+            night=DEFAULT_CAM_NIGHT,
+            force=True,
+        )
 
     def center_turret(self) -> None:
         with self._lock:
@@ -1704,7 +2385,45 @@ class AutoAimEngine:
             self._wait_frame_after = now + 0.12
             self._motion_suppress_until = max(self._motion_suppress_until, now + 1.2)
             self._motion_prev_gray = None
+            self.hardware.center()
             self._sync_hardware_locked()
+
+    def failsafe_off(self) -> None:
+        """Emergency/disconnect fail-safe: immediately force Laser and Flash OFF on ESP32."""
+        with self._lock:
+            now = time.time()
+            self._manual_led = False
+            self._manual_laser = False
+            self._auto_fire_active = False
+            self._eco_flash_active = False
+            self._eco_flash_until = 0.0
+            self._led_on = False
+            self._laser_on = False
+            self._motion_suppress_until = max(self._motion_suppress_until, now + 2.0)
+            self._motion_prev_gray = None
+            self.hardware.force_failsafe()
+
+    def _apply_stream_loss_failsafe(self) -> None:
+        """If the video stream drops, immediately turn off Auto-Aim firing and Eco Flash."""
+        with self._lock:
+            changed = False
+            if self._auto_fire_active:
+                self._auto_fire_active = False
+                changed = True
+            if self._eco_flash_active:
+                self._eco_flash_active = False
+                self._eco_flash_until = 0.0
+                changed = True
+            if self._person_detected or self._target_type is not None:
+                self._person_detected = False
+                self._target_type = None
+                self._detections_count = 0
+                self._target_box = None
+                self._target_center = None
+                self._error_px = [0, 0]
+                self._smoothed_target = None
+            if changed:
+                self._sync_hardware_locked()
 
     def set_manual_angles(self, x: float, y: float) -> None:
         self.apply_servo_command(x=x, y=y)
@@ -1716,7 +2435,7 @@ class AutoAimEngine:
         self.apply_servo_command(laser=bool(state))
 
     def set_resolution(self, res_code: int) -> None:
-        self.apply_servo_command(res=int(res_code))
+        self.apply_cam_command(res=int(res_code), force=True)
 
     def send_discord_test(self) -> Tuple[bool, str]:
         frame, _, _ = self.reader.get_latest_frame()
@@ -1737,7 +2456,8 @@ class AutoAimEngine:
         hw = self.hardware.get_state()
         discord_status = self.discord.get_status()
         rotation = self.reader.get_rotation()
-        stream_connected = self.reader.is_connected()
+        stream_stats = self.reader.get_stats()
+        stream_connected = bool(stream_stats["connected"])
         with self._lock:
             now = time.time()
             cv_enabled = (self.auto_aim or self.detect_in_manual) and (self.detect_person or self.detect_dog)
@@ -1777,6 +2497,10 @@ class AutoAimEngine:
                 "invert_y": self.invert_y,
                 "rotation": rotation,
                 "resolution": self.resolution,
+                "cam_bri": self.cam_bri,
+                "cam_ae": self.cam_ae,
+                "cam_gain": self.cam_gain,
+                "cam_night": self.cam_night,
                 "frame_size": list(self._frame_size),
                 "person_detected": self._person_detected,
                 "target_type": self._target_type,
@@ -1793,13 +2517,19 @@ class AutoAimEngine:
                 "fps": round(self._cv_fps if cv_enabled else self._video_fps, 1),
                 "cv_fps": round(self._cv_fps, 1),
                 "video_fps": round(self._video_fps, 1),
+                "stream_fps": round(float(stream_stats["stream_fps"]), 1),
+                "stream_frame_kb": round(int(stream_stats["last_frame_bytes"]) / 1024.0, 1),
+                "stream_error": str(stream_stats["last_error"]),
                 "inference_ms": round(self._inference_ms, 1),
                 "device": self.detector.device_info,
                 "stream_connected": stream_connected,
                 "turret_url": self.hardware.base_url,
+                "hw_move_interval_ms": hw["move_interval_ms"],
                 "hw_rtt_ms": hw["last_rtt_ms"],
                 "hw_error": hw["last_error"],
                 "hw_last_url": hw["last_url"],
+                "hw_last_payload": hw["last_payload"],
+                "hw_last_cam_payload": hw["last_cam_payload"],
                 **discord_status,
             }
 
@@ -1895,6 +2625,8 @@ class AutoAimEngine:
         while not self._stop_event.is_set():
             frame, frame_id, frame_ts = self.reader.get_latest_frame()
             if frame is None or frame_id == last_frame_id:
+                if not self.reader.is_connected():
+                    self._apply_stream_loss_failsafe()
                 time.sleep(0.008)
                 continue
             last_frame_id = frame_id
@@ -2065,7 +2797,10 @@ class AutoAimEngine:
                     err_y = ty - cy
 
                     if active_auto_aim:
-                        if (now - self._last_servo_step_time) >= self.min_servo_interval:
+                        effective_interval = max(
+                            self.min_servo_interval, self.hardware.get_effective_move_interval()
+                        )
+                        if (now - self._last_servo_step_time) >= effective_interval:
                             px_per_deg_x = 10.3 * (w / 600.0)
                             px_per_deg_y = 9.2 * (h / 800.0)
 

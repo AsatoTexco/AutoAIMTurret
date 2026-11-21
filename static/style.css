@@ -1747,6 +1747,16 @@ kbd {
   margin-top: 2px;
 }
 
+.preset-chips.cols-6 {
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+}
+
+.preset-chips.cols-6 .preset-chip {
+  padding: 6px 2px;
+  font-size: 11px;
+}
+
 .preset-chip {
   padding: 6px 4px;
   border-radius: 7px;
@@ -2195,8 +2205,32 @@ input[type="range"]::-moz-range-thumb {
 /* Resolution Grid */
 .res-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
+}
+
+.res-grid.compact-res {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.cam-reset-btn {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cam-reset-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: rgba(56, 189, 248, 0.55);
 }
 
 .res-btn {

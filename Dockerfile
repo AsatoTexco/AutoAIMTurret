@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     AUTOAIM_BACKEND=auto \
     AUTOAIM_CPU_THREADS=4 \
-    AUTOAIM_MAX_FPS=20
+    AUTOAIM_MAX_FPS=30
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
