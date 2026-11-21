@@ -101,7 +101,7 @@ RESOLUTION_OPTIONS = {
 WIDE_RESOLUTION_OPTIONS = {
     0: ("QVGA 16:9", 320, 176),
     1: ("CIF 16:9", 400, 224),
-    2: ("VGA 16:9", 640, 360),
+    2: ("VGA 16:9", 640, 352),
     3: ("SVGA 16:9", 800, 448),
 }
 

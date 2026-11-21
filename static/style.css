@@ -349,7 +349,7 @@ body.game-mode-active {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  min-height: 440px;
+  min-height: 280px;
   display: flex;
   align-items: center;
   justify-content: center;

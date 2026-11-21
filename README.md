@@ -26,7 +26,7 @@ Configurações da câmera são enviadas separadamente sem interferir nos servos
 | Parâmetro | Intervalo | Padrão | Descrição |
 | :--- | :--- | :--- | :--- |
 | `res` | `0..3` | `1` | Resolução (`0=QVGA`, `1=CIF` padrão ~25–28 FPS, `2=VGA`, `3=SVGA`) |
-| `wide` | `0` ou `1` | `1` | Modo Widescreen `16:9` horizontal ao girar 90° (`320×176`, `400×224`, `640×360`, `800×448`) |
+| `wide` | `0` ou `1` | `1` | Modo Widescreen `16:9` horizontal ao girar 90° (`320×176`, `400×224`, `640×352`, `800×448`) |
 | `qual` | `10..40` | `16` | Qualidade JPEG (menor = mais nítido; `16` equilibra nitidez e banda) |
 | `bri` | `-3..3` | `1` | Brilho |
 | `ae` | `-5..5` | `1` | Nível de exposição automática |
