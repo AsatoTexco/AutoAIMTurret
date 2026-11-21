@@ -346,8 +346,8 @@
                   <label class="drawer-label">Resolução da Câmera</label>
                   <div class="res-grid compact-res" id="gameResGrid">
                     <button type="button" class="res-btn" data-res="0" onclick="selectResolution(0)"><strong>QVGA</strong><span>320×240</span></button>
-                    <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
-                    <button type="button" class="res-btn active" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×600</span></button>
+                    <button type="button" class="res-btn active" data-res="2" onclick="selectResolution(2)"><strong>VGA</strong><span>640×480</span></button>
+                    <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)"><strong>SVGA</strong><span>800×600</span></button>
                   </div>
                 </div>
               </div>
@@ -481,7 +481,7 @@
           <div class="telemetry-card">
             <span class="t-label">Single-Flight</span>
             <span class="t-val" id="mRtt">— ms</span>
-            <span class="t-sub" id="mPriorityTag">0ms Prio · 30ms Mov</span>
+            <span class="t-sub" id="mPriorityTag">0ms Prio · 20ms Mov</span>
           </div>
         </div>
       </section>
@@ -542,7 +542,7 @@
           <div class="panel-card">
             <div class="card-header">
               <h2>Controle Manual Pan / Tilt</h2>
-              <span class="chip-meta" id="manualStatusBadge">30 ms HTTP · Single-Flight</span>
+              <span class="chip-meta" id="manualStatusBadge">20 ms HTTP · Single-Flight</span>
             </div>
 
             <div id="gimbalPad" class="gimbal-pad" title="Arraste para mover a câmera manualmente">
@@ -905,20 +905,28 @@
               <button type="button" class="res-btn" data-res="1" onclick="selectResolution(1)">
                 <strong>CIF</strong><span>400×296</span>
               </button>
-              <button type="button" class="res-btn" data-res="2" onclick="selectResolution(2)">
-                <strong>VGA</strong><span>640×480</span>
+              <button type="button" class="res-btn active" data-res="2" onclick="selectResolution(2)">
+                <strong>VGA</strong><span>640×480 (30 FPS)</span>
               </button>
-              <button type="button" class="res-btn active" data-res="3" onclick="selectResolution(3)">
+              <button type="button" class="res-btn" data-res="3" onclick="selectResolution(3)">
                 <strong>SVGA</strong><span>800×600 (Máx)</span>
               </button>
             </div>
-            <p class="card-hint">Resolução máxima travada em SVGA (800×600, ~28 FPS estáveis). Alterações são enviadas via GET /cam?res=0..3.</p>
+            <p class="card-hint">VGA (640×480) é o padrão recomendado: encaixe 1:1 no YOLOv8n (640) com 30 FPS estáveis. Alterações são enviadas via GET /cam?res=0..3.</p>
           </div>
 
           <div class="panel-card">
             <div class="card-header">
               <h2>Ajustes de Imagem (OV3660)</h2>
               <span class="chip-meta">GET /cam</span>
+            </div>
+
+            <div class="slider-field">
+              <div class="field-top">
+                <label for="camQual">Qualidade JPEG (qual · menor = mais nítido)</label>
+                <span class="mono-val" id="camQualVal">16</span>
+              </div>
+              <input type="range" id="camQual" min="10" max="40" step="1" value="16" oninput="updateLabels()" onchange="onCamQualChange()">
             </div>
 
             <div class="slider-field">
@@ -932,9 +940,9 @@
             <div class="slider-field">
               <div class="field-top">
                 <label for="camAe">Exposição Auto (ae)</label>
-                <span class="mono-val" id="camAeVal">+3</span>
+                <span class="mono-val" id="camAeVal">+2</span>
               </div>
-              <input type="range" id="camAe" min="-5" max="5" step="1" value="3" oninput="updateLabels()" onchange="onCamAeChange()">
+              <input type="range" id="camAe" min="-5" max="5" step="1" value="2" oninput="updateLabels()" onchange="onCamAeChange()">
             </div>
 
             <div class="slider-field">
@@ -956,16 +964,16 @@
             <div class="toggle-row">
               <div>
                 <div class="row-title">Modo Noturno (night / aec2)</div>
-                <div class="row-sub">Compensação de exposição em baixa luminosidade</div>
+                <div class="row-sub">Desligado = mantém 30 FPS fixos; ligado = longa exposição no escuro</div>
               </div>
               <label class="switch">
-                <input type="checkbox" id="camNight" checked onchange="onCamNightChange()">
+                <input type="checkbox" id="camNight" onchange="onCamNightChange()">
                 <span class="slider"></span>
               </label>
             </div>
 
             <button type="button" id="btnCamReset" class="cam-reset-btn" onclick="resetCamDefaults()">
-              Restaurar Padrão OV3660 (bri=+1 · ae=+3 · 64x · night=1)
+              Restaurar Padrão OV3660 (qual=16 · bri=+1 · ae=+2 · 64x · night=0)
             </button>
           </div>
 
@@ -1018,7 +1026,7 @@
             </div>
             <div class="proto-meta">
               <span>ESP32: <strong id="metaTurretUrl">—</strong></span>
-              <span>Link: <strong id="metaTransportInfo">HTTP keep-alive (/servo + /cam) · 30 ms · Auto-Detach 500ms</strong></span>
+              <span>Link: <strong id="metaTransportInfo">HTTP keep-alive (/servo + /cam) · 20 ms · Auto-Detach 500ms</strong></span>
               <span id="metaHwError" class="proto-err"></span>
             </div>
             <p class="card-hint">GET /servo controla Pan/Tilt/Laser/Flash sem rampa (Auto-Detach em 500 ms). GET /cam ajusta resolução e sensor OV3660 separadamente. Laser e Flash desligam ao encerrar.</p>

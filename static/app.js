@@ -248,11 +248,12 @@ const state = {
   autoAim: true,
   aimMode: 'center',
   rotation: 90,
-  resolution: 3,
+  resolution: 2,
+  camQual: 16,
   camBri: 1,
-  camAe: 3,
+  camAe: 2,
   camGain: 5,
-  camNight: true,
+  camNight: false,
   lastCamSentAt: 0,
   autoFireLaser: true,
   autoFireLed: false,
@@ -260,7 +261,7 @@ const state = {
   invertY: false,
 
   // Hardware control timing & last payload
-  hwMoveIntervalMs: 30,
+  hwMoveIntervalMs: 20,
   hwLastPayload: '',
 
   // Eco mode
@@ -335,7 +336,7 @@ const swipeAimState = {
 
 const sf = new SingleFlightController({
   endpoint: '/servo',
-  moveIntervalMs: 30,
+  moveIntervalMs: 20,
   onDispatch: ({ url, rttMs, isPriority }) => {
     const roundedRtt = `${Math.round(rttMs)} ms`;
     const elProto = document.getElementById('protoPreview');
@@ -1102,12 +1103,17 @@ function updateLabels() {
     btn.classList.toggle('active', parseInt(btn.dataset.cd, 10) === cdVal);
   });
 
+  const qualEl = document.getElementById('camQual');
   const briEl = document.getElementById('camBri');
   const aeEl = document.getElementById('camAe');
   const gainEl = document.getElementById('camGain');
+  const qualVal = qualEl ? parseInt(qualEl.value, 10) : state.camQual;
   const briVal = briEl ? parseInt(briEl.value, 10) : state.camBri;
   const aeVal = aeEl ? parseInt(aeEl.value, 10) : state.camAe;
   const gainVal = gainEl ? parseInt(gainEl.value, 10) : state.camGain;
+  if (qualEl) {
+    document.getElementById('camQualVal').textContent = String(qualVal);
+  }
   if (briEl) {
     document.getElementById('camBriVal').textContent = briVal > 0 ? `+${briVal}` : String(briVal);
   }
@@ -1267,6 +1273,9 @@ async function sendCamCommand(patch = {}) {
   if (patch.res !== undefined && patch.res !== null) {
     params.set('res', String(Math.max(0, Math.min(3, parseInt(patch.res, 10)))));
   }
+  if (patch.qual !== undefined && patch.qual !== null) {
+    params.set('qual', String(Math.max(10, Math.min(40, parseInt(patch.qual, 10)))));
+  }
   if (patch.bri !== undefined && patch.bri !== null) {
     params.set('bri', String(Math.max(-3, Math.min(3, parseInt(patch.bri, 10)))));
   }
@@ -1300,6 +1309,13 @@ function selectResolution(code) {
   renderResolutionGrid(clamped);
   sendCamCommand({ res: clamped });
   showToast(`Resolução (/cam): ${RES_NAMES[clamped] || clamped}`, 1800);
+}
+
+function onCamQualChange() {
+  const val = Math.max(10, Math.min(40, parseInt(document.getElementById('camQual').value, 10)));
+  state.camQual = val;
+  updateLabels();
+  sendCamCommand({ qual: val });
 }
 
 function onCamBriChange() {
@@ -1336,21 +1352,24 @@ function onCamNightChange() {
 }
 
 function resetCamDefaults() {
+  state.camQual = 16;
   state.camBri = 1;
-  state.camAe = 3;
+  state.camAe = 2;
   state.camGain = 5;
-  state.camNight = true;
+  state.camNight = false;
+  const elQual = document.getElementById('camQual');
   const elBri = document.getElementById('camBri');
   const elAe = document.getElementById('camAe');
   const elGain = document.getElementById('camGain');
   const elNight = document.getElementById('camNight');
+  if (elQual) elQual.value = '16';
   if (elBri) elBri.value = '1';
-  if (elAe) elAe.value = '3';
+  if (elAe) elAe.value = '2';
   if (elGain) elGain.value = '5';
-  if (elNight) elNight.checked = true;
+  if (elNight) elNight.checked = false;
   updateLabels();
-  sendCamCommand({ bri: 1, ae: 3, gain: 5, night: true });
-  showToast('Sensor OV3660 restaurado (bri=+1, ae=+3, 64x, night=1)', 2000);
+  sendCamCommand({ qual: 16, bri: 1, ae: 2, gain: 5, night: false });
+  showToast('Sensor OV3660 restaurado (qual=16, bri=+1, ae=+2, 64x, night=0)', 2000);
 }
 
 function renderSegmented(selector, attr, activeValue) {
@@ -1757,9 +1776,13 @@ function applyStatus(s) {
 
     if (s.frame_size && s.frame_size[0] > 0) {
       const resShort = RES_NAMES[s.resolution]?.split(' ')[0] || '';
+      const streamFpsTag =
+        typeof s.stream_fps === 'number' && s.stream_fps > 0
+          ? ` · Cam ${s.stream_fps.toFixed(0)} FPS`
+          : '';
       const vidFpsInfo = ecoActive && typeof s.video_fps === 'number'
         ? `ECO · Vídeo ${s.video_fps.toFixed(0)} FPS`
-        : `${s.frame_size[0]}×${s.frame_size[1]} · ${resShort}`;
+        : `${s.frame_size[0]}×${s.frame_size[1]} ${resShort}${streamFpsTag}`;
       document.getElementById('mFrameRes').textContent = vidFpsInfo;
     }
 
@@ -1853,11 +1876,12 @@ function applyStatus(s) {
       state.autoAim = Boolean(s.auto_aim);
       state.aimMode = s.aim_mode || 'center';
       state.rotation = s.rotation ?? 90;
-      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 3));
+      state.resolution = Math.max(0, Math.min(3, s.resolution ?? 2));
+      state.camQual = typeof s.cam_qual === 'number' ? s.cam_qual : 16;
       state.camBri = typeof s.cam_bri === 'number' ? s.cam_bri : 1;
-      state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 3;
+      state.camAe = typeof s.cam_ae === 'number' ? s.cam_ae : 2;
       state.camGain = typeof s.cam_gain === 'number' ? s.cam_gain : 5;
-      state.camNight = s.cam_night !== undefined ? Boolean(s.cam_night) : true;
+      state.camNight = s.cam_night !== undefined ? Boolean(s.cam_night) : false;
       state.autoFireLaser = s.auto_fire_laser !== undefined ? Boolean(s.auto_fire_laser) : true;
       state.autoFireLed = s.auto_fire_led !== undefined ? Boolean(s.auto_fire_led) : false;
       state.invertX = Boolean(s.invert_x);
@@ -1903,10 +1927,12 @@ function applyStatus(s) {
       document.getElementById('conf').value = s.conf_threshold;
       document.getElementById('invX').checked = state.invertX;
       document.getElementById('invY').checked = state.invertY;
+      const elCamQual = document.getElementById('camQual');
       const elCamBri = document.getElementById('camBri');
       const elCamAe = document.getElementById('camAe');
       const elCamGain = document.getElementById('camGain');
       const elCamNight = document.getElementById('camNight');
+      if (elCamQual) elCamQual.value = state.camQual;
       if (elCamBri) elCamBri.value = state.camBri;
       if (elCamAe) elCamAe.value = state.camAe;
       if (elCamGain) elCamGain.value = state.camGain;
@@ -1943,6 +1969,12 @@ function applyStatus(s) {
           renderResolutionGrid(state.resolution);
         }
         let camLabelDirty = false;
+        if (typeof s.cam_qual === 'number' && s.cam_qual !== state.camQual) {
+          state.camQual = s.cam_qual;
+          const el = document.getElementById('camQual');
+          if (el) el.value = state.camQual;
+          camLabelDirty = true;
+        }
         if (typeof s.cam_bri === 'number' && s.cam_bri !== state.camBri) {
           state.camBri = s.cam_bri;
           const el = document.getElementById('camBri');

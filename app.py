@@ -111,11 +111,12 @@ def cam_control():
     """Camera settings route mirroring ESP32-CAM GET /cam on port 80 (OV3660).
 
     Accepted optional & combinable query parameters (<= 95 chars):
-      res=0..3     -> Resolution (0=QVGA, 1=CIF, 2=VGA, 3=SVGA max)
+      res=0..3     -> Resolution (0=QVGA, 1=CIF, 2=VGA default 30 FPS, 3=SVGA max)
+      qual=10..40  -> JPEG quality (lower = sharper, default 16)
       bri=-3..3    -> Brightness (default 1)
-      ae=-5..5     -> Auto-exposure level (default 3)
+      ae=-5..5     -> Auto-exposure level (default 2)
       gain=0..5    -> OV3660 gainceiling (0=2x..5=64x, default 5)
-      night=0|1    -> Night mode / aec2 (default 1)
+      night=0|1    -> Night mode / aec2 (default 0 for locked 30 FPS)
     """
     if request.method == "OPTIONS":
         return Response("", status=204)
@@ -142,6 +143,7 @@ def cam_control():
             return raw.lower() in ("true", "on")
 
     res = _parse_int("res")
+    qual = _parse_int("qual")
     bri = _parse_int("bri")
     ae = _parse_int("ae")
     gain = _parse_int("gain")
@@ -149,6 +151,7 @@ def cam_control():
 
     engine.apply_cam_command(
         res=res,
+        qual=qual,
         bri=bri,
         ae=ae,
         gain=gain,
@@ -164,24 +167,34 @@ def cam_control():
 def video_feed():
     def generate():
         last_id = -1
-        while True:
-            cur_engine = engine
-            if cur_engine is None:
-                time.sleep(0.1)
-                continue
-            if cur_engine.is_stopped():
-                break
-            jpg, cur_id = cur_engine.wait_for_annotated_jpeg(last_id, timeout=1.0)
-            if jpg is None or cur_id == last_id:
-                continue
-            last_id = cur_id
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                + f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii")
-                + jpg
-                + b"\r\n"
-            )
+        registered_engine: Optional[AutoAimEngine] = None
+        try:
+            while True:
+                cur_engine = engine
+                if cur_engine is None:
+                    time.sleep(0.1)
+                    continue
+                if registered_engine is not cur_engine:
+                    if registered_engine is not None:
+                        registered_engine.unregister_video_client()
+                    cur_engine.register_video_client()
+                    registered_engine = cur_engine
+                if cur_engine.is_stopped():
+                    break
+                jpg, cur_id = cur_engine.wait_for_annotated_jpeg(last_id, timeout=1.0)
+                if jpg is None or cur_id == last_id:
+                    continue
+                last_id = cur_id
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii")
+                    + jpg
+                    + b"\r\n"
+                )
+        finally:
+            if registered_engine is not None:
+                registered_engine.unregister_video_client()
 
     resp = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -233,11 +246,12 @@ def api_action():
         y = float(data.get("y", 90))
         engine.set_manual_angles(x, y)
     elif action == "set_resolution":
-        res_code = int(data.get("res", 3))
+        res_code = int(data.get("res", 2))
         engine.set_resolution(res_code)
     elif action == "set_cam":
         engine.apply_cam_command(
             res=int(data["res"]) if data.get("res") is not None else None,
+            qual=int(data["qual"]) if data.get("qual") is not None else None,
             bri=int(data["bri"]) if data.get("bri") is not None else None,
             ae=int(data["ae"]) if data.get("ae") is not None else None,
             gain=int(data["gain"]) if data.get("gain") is not None else None,
@@ -298,6 +312,7 @@ def main() -> None:
     print(f"[AutoAIM] Dashboard Web disponível em http://localhost:{args.port}/")
 
     if args.show_window:
+        engine.set_window_enabled(True)
         flask_thread = threading.Thread(
             target=lambda: app.run(
                 host=args.host,
